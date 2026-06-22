@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UpGainPulse v2.0 - Preview</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 40px;
+        }
+        .container { max-width: 1000px; margin: auto; }
+        h1 { font-size: 2.5rem; background: linear-gradient(135deg, #22d3ee, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 8px; }
+        .subtitle { color: #94a3b8; font-size: 1.1rem; margin-bottom: 40px; }
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 28px;
+            margin-bottom: 24px;
+            border: 1px solid #334155;
+        }
+        .card h2 {
+            color: #38bdf8;
+            font-size: 1.3rem;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .ticker-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin: 16px 0;
+        }
+        .ticker {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+        }
+        .ticker .sym { font-size: 1.5rem; font-weight: bold; color: #f1f5f9; }
+        .ticker .desc { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }
+        .flow {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 12px;
+            margin: 20px 0;
+        }
+        .flow-step {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px 20px;
+            text-align: center;
+            flex: 1;
+            min-width: 120px;
+        }
+        .flow-step .time { color: #22d3ee; font-weight: bold; font-size: 0.9rem; }
+        .flow-step .action { color: #e2e8f0; margin-top: 4px; font-size: 0.9rem; }
+        .flow-arrow { color: #475569; font-size: 1.5rem; }
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        .config-item {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 14px;
+        }
+        .config-item .label { color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; }
+        .config-item .value { color: #f1f5f9; font-size: 1.2rem; font-weight: bold; margin-top: 4px; }
+        .formula {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px 20px;
+            font-family: 'Courier New', monospace;
+            color: #a78bfa;
+            margin: 12px 0;
+            font-size: 0.95rem;
+        }
+        .code-block {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px 20px;
+            font-family: 'Courier New', monospace;
+            color: #e2e8f0;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+        .code-comment { color: #64748b; }
+        .code-keyword { color: #38bdf8; }
+        .code-string { color: #a78bfa; }
+        .code-number { color: #f59e0b; }
+        .file-list {
+            list-style: none;
+        }
+        .file-list li {
+            padding: 8px 12px;
+            border-left: 3px solid #334155;
+            margin-bottom: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+        .file-list li:hover { border-left-color: #38bdf8; background: #0f172a; }
+        .file-desc { color: #94a3b8; font-family: -apple-system, sans-serif; font-size: 0.8rem; margin-left: 8px; }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+        .badge-green { background: #065f46; color: #6ee7b7; }
+        .badge-blue { background: #1e3a5f; color: #7dd3fc; }
+        .badge-purple { background: #3b1f6e; color: #c4b5fd; }
+        .time-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #1e293b;
+        }
+        .time-row:last-child { border: none; }
+        .time-row .tz { color: #22d3ee; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📈 UpGainPulse v2.0</h1>
+        <p class="subtitle">Multi-Ticker Headless ORB Bot for Paper Trading · Alpaca API · Melbourne Time</p>
+
+        <!-- What It Is -->
+        <div class="card">
+            <h2>🤖 What It Does</h2>
+            <p style="color: #cbd5e1; line-height: 1.7;">
+                UpGainPulse is a <strong>fully automated paper trading bot</strong> that runs overnight while you sleep 
+                (Melbourne time). It monitors 5 highly liquid US tickers during the regular trading session, 
+                identifies the <strong>Opening Range Breakout (ORB)</strong> pattern, and executes 
+                <strong>bracket orders</strong> with automatic take-profit and stop-loss. All trades go through 
+                Alpaca's <strong>paper trading</strong> API — no real money at risk.
+            </p>
+        </div>
+
+        <!-- Configuration -->
+        <div class="card">
+            <h2>⚙️ Current Configuration</h2>
+            <div class="config-grid">
+                <div class="config-item">
+                    <div class="label">Account Capital</div>
+                    <div class="value">$500.00</div>
+                </div>
+                <div class="config-item">
+                    <div class="label">Risk Per Trade</div>
+                    <div class="value">$50.00</div>
+                    <div style="color:#64748b; font-size:0.8rem;">(10% of account)</div>
+                </div>
+                <div class="config-item">
+                    <div class="label">Stop Loss</div>
+                    <div class="value">$0.10</div>
+                    <div style="color:#64748b; font-size:0.8rem;">per share</div>
+                </div>
+                <div class="config-item">
+                    <div class="label">Risk/Reward</div>
+                    <div class="value">2:1</div>
+                    <div style="color:#64748b; font-size:0.8rem;">(TP = 2× SL)</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tickers -->
+        <div class="card">
+            <h2>📊 Ticker Portfolio</h2>
+            <div class="ticker-grid">
+                <div class="ticker"><div class="sym">SPY</div><div class="desc">S&P 500 ETF · Broad market</div></div>
+                <div class="ticker"><div class="sym">QQQ</div><div class="desc">Nasdaq ETF · Tech exposure</div></div>
+                <div class="ticker"><div class="sym">IWM</div><div class="desc">Russell 2000 ETF · Mid-cap</div></div>
+                <div class="ticker"><div class="sym">AAPL</div><div class="desc">Apple Inc · Mega-cap tech</div></div>
+                <div class="ticker"><div class="sym">MSFT</div><div class="desc">Microsoft · Mega-cap cloud</div></div>
+            </div>
+        </div>
+
+        <!-- Trading Strategy Flow -->
+        <div class="card">
+            <h2>🔄 ORB Strategy Flow</h2>
+            <div class="flow">
+                <div class="flow-step">
+                    <div class="time">9:30 - 9:45 AM ET</div>
+                    <div class="action">Build Range</div>
+                    <div style="color:#64748b; font-size:0.75rem; margin-top:4px;">Track high & low</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="time">9:45 AM ET</div>
+                    <div class="action">🔒 Lock Range</div>
+                    <div style="color:#64748b; font-size:0.75rem; margin-top:4px;">Freeze [low, high]</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="time">9:45 AM - 4:00 PM ET</div>
+                    <div class="action">🎯 Hunt Breakout</div>
+                    <div style="color:#64748b; font-size:0.75rem; margin-top:4px;">Price > range high?</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="time">On Breakout</div>
+                    <div class="action">🚀 Send Bracket Order</div>
+                    <div style="color:#64748b; font-size:0.75rem; margin-top:4px;">TP + SL auto-set</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Position Sizing -->
+        <div class="card">
+            <h2>🧮 Position Sizing Formula</h2>
+            <div class="formula">
+                Qty = (Risk ÷ Stop Loss $) ÷ Current Price × Multiplier
+            </div>
+            <div class="formula" style="margin-top:0; color:#6ee7b7;">
+                Qty = ($50 ÷ $0.10) ÷ $500 × 1.0 = <strong>1 share</strong> (SPY @ $500)
+            </div>
+            <div class="code-block">
+                <span class="code-comment"># Example: SPY @ $500</span>
+                Entry:  $500.00
+                SL:     $499.90 <span class="code-comment">(-$0.10)</span>
+                TP:     $500.20 <span class="code-comment">(+$0.20, 2:1 RR)</span>
+                P&L if TP:  +$0.20
+                P&L if SL:  -$0.10
+            </div>
+        </div>
+
+        <!-- Melbourne Time Schedule -->
+        <div class="card">
+            <h2>⏰ Melbourne Time Schedule (AEST)</h2>
+            <div class="time-row">
+                <span>12:30 AM - 7:00 AM</span>
+                <span class="tz">Bot runs (US market hours)</span>
+            </div>
+            <div class="time-row">
+                <span>4:00 AM - 7:00 AM</span>
+                <span class="tz">Last 3 hours — can monitor live</span>
+            </div>
+            <div class="time-row">
+                <span>7:00+ AM</span>
+                <span class="tz">Market closed → Check results</span>
+            </div>
+        </div>
+
+        <!-- Project Structure -->
+        <div class="card">
+            <h2>📁 Project Structure</h2>
+            <ul class="file-list">
+                <li><span style="color:#f59e0b;">upgainpulse.py</span> <span class="file-desc">— Main bot: ORB logic, WebSocket, order execution</span>
+                    <div style="color:#64748b; font-size:0.8rem; padding-left:20px;">
+                        Classes: UpGainPulseEngine, ORBStateMachine, AlpacaPaperTrader, TradeLogger, AccountValidator, RobustWebSocketManager
+                    </div>
+                </li>
+                <li><span style="color:#f59e0b;">analytics.py</span> <span class="file-desc">— Performance reporting: win rate, P&L, profit factor</span></li>
+                <li><span style="color:#f59e0b;">test_core.py</span> <span class="file-desc">— ✅ 45+ unit tests across all modules</span></li>
+                <li><span style="color:#f59e0b;">requirements.txt</span> <span class="file-desc">— Dependencies: alpaca-py, pytz, pandas, etc.</span></li>
+                <li><span style="color:#f59e0b;">.env</span> <span class="file-desc">— Alpaca Paper API keys (configured)</span></li>
+                <li><span style="color:#f59e0b;">CONFIG.md</span> <span class="file-desc">— Configuration documentation</span></li>
+            </ul>
+        </div>
+
+        <!-- Sample Output -->
+        <div class="card">
+            <h2>📋 Sample Analytics Output</h2>
+            <div class="code-block">
+============================================================
+  SPY PERFORMANCE
+============================================================
+  Total: 12 | Wins: 8 | Loss: 4
+  Win Rate: 66.67%
+  Net P&L: +$14.40
+  Profit Factor: 2.65x
+  Avg Win: $2.15 | Avg Loss: -$0.42
+============================================================
+            </div>
+            <p style="color:#94a3b8; font-size:0.85rem; margin-top:8px;">
+                Run <span style="color:#22d3ee; font-family: monospace;">python analytics.py</span> to view after each trading session.
+            </p>
+        </div>
+
+        <!-- How to Run -->
+        <div class="card">
+            <h2>🚀 How to Run</h2>
+            <div class="code-block">
+<span class="code-comment"># Install dependencies</span>
+pip install -r requirements.txt
+
+<span class="code-comment"># Start the bot (runs headless until market close)</span>
+python upgainpulse.py
+
+<span class="code-comment"># Check results</span>
+python analytics.py
+
+<span class="code-comment"># Run tests</span>
+python test_core.py -v
+            </div>
+        </div>
+
+        <!-- Fixed Issues -->
+        <div class="card">
+            <h2>✅ Fixed Issues from v1</h2>
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); gap:8px;">
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> Timezone handling (UTC → ET)
+                </div>
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> Position sizing formula
+                </div>
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> Capital validation before orders
+                </div>
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> Daily state reset (multi-day)
+                </div>
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> Exit price tracking
+                </div>
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> WebSocket reconnection
+                </div>
+                <div style="background:#0f172a; padding:10px 14px; border-radius:6px; border:1px solid #065f46;">
+                    <span class="badge badge-green">FIXED</span> Thread-safe database
+                </div>
+            </div>
+        </div>
+
+        <!-- Architecture Summary -->
+        <div class="card">
+            <h2>🏗️ Architecture</h2>
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+                <div>
+                    <h3 style="color:#22d3ee; font-size:1rem; margin-bottom:8px;">UpGainPulseEngine</h3>
+                    <ul style="color:#94a3b8; font-size:0.85rem; line-height:1.8; list-style:disc; padding-left:20px;">
+                        <li>Orchestrates all tickers</li>
+                        <li>Spins up ORBStateMachine per ticker</li>
+                        <li>Manages WebSocket subscription</li>
+                        <li>Handles graceful shutdown</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3 style="color:#22d3ee; font-size:1rem; margin-bottom:8px;">ORBStateMachine</h3>
+                    <ul style="color:#94a3b8; font-size:0.85rem; line-height:1.8; list-style:disc; padding-left:20px;">
+                        <li>Per-ticker state machine</li>
+                        <li>Tracks ORB range [low, high]</li>
+                        <li>Detects breakout condition</li>
+                        <li>Daily automatic reset</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3 style="color:#22d3ee; font-size:1rem; margin-bottom:8px;">AlpacaPaperTrader</h3>
+                    <ul style="color:#94a3b8; font-size:0.85rem; line-height:1.8; list-style:disc; padding-left:20px;">
+                        <li>Submits bracket orders</li>
+                        <li>Validates buying power</li>
+                        <li>Rate limiting (cooldown)</li>
+                        <li>Error handling + retries</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3 style="color:#22d3ee; font-size:1rem; margin-bottom:8px;">TradeLogger</h3>
+                    <ul style="color:#94a3b8; font-size:0.85rem; line-height:1.8; list-style:disc; padding-left:20px;">
+                        <li>SQLite + WAL mode</li>
+                        <li>Thread-safe with locks</li>
+                        <li>Logs every entry/exit</li>
+                        <li>Powers analytics module</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div style="text-align:center; padding: 40px 0; color: #475569;">
+            <p>Paper trading only · No real money at risk</p>
+            <p style="font-size:0.85rem; margin-top:4px;">Built with Python · Alpaca API · SQLite</p>
+        </div>
+    </div>
+</body>
+</html>

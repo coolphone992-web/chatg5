@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.trading.models import TakeProfitRequest, StopLossRequest
-from alpaca.trading.errors import APIError
+from alpaca.trading import TakeProfitRequest, StopLossRequest
+from alpaca.common import APIError
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 
@@ -211,7 +211,7 @@ class AccountValidator:
 # =============================================================================
 class AlpacaPaperTrader:
     def __init__(self, api_key: str, secret_key: str, logger_obj: TradeLogger, account_validator: AccountValidator):
-        self.client = TradingClient(api_key, secret_key, base_url=PAPER_API_ENDPOINT)
+        self.client = TradingClient(api_key, secret_key, paper=True)
         self.logger_obj = logger_obj
         self.validator = account_validator
         self.last_order_time = {}
@@ -444,7 +444,7 @@ class UpGainPulseEngine:
         self.config = config
         validate_config(self.config)
         self.logger_obj = TradeLogger()
-        alpaca_client = TradingClient(API_KEY, SECRET_KEY, base_url=PAPER_API_ENDPOINT)
+        alpaca_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
         validator = AccountValidator(alpaca_client)
         self.trader = AlpacaPaperTrader(API_KEY, SECRET_KEY, self.logger_obj, validator)
         self.state_machines = {ticker: ORBStateMachine(ticker, self.trader, config) for ticker in tickers}

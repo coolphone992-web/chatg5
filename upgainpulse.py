@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.trading import TakeProfitRequest, StopLossRequest
-from alpaca.common import APIError
+from alpaca.trading.models import TakeProfitRequest, StopLossRequest
+from alpaca.trading.errors import APIError
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 
@@ -316,12 +316,15 @@ class TradingStateMachine:
         self.base_config = base_config # Store base config, adaptive learner provides specific config
         self.adaptive_learner = adaptive_learner
         self.market_open_et = time(9, 30)
+        self.market_close_et = time(16, 0) # NEW: Market close time
         self.range_end_et = time(9, 45)
-        # Historical data for indicator calculation (MUST be before reset_daily_state)
+        self.reset_daily_state()
+
+        # Historical data for indicator calculation
         self.bars: Deque[Bar] = deque(maxlen=50) # Store last 50 bars for SMA/RSI
         self.closes: Deque[float] = deque(maxlen=50) # Store last 50 closes for SMA/RSI
-
-        self.reset_daily_state()
+        self.volumes: Deque[float] = deque(maxlen=50) # NEW: Store last 50 volumes for Rel Volume
+        self.previous_day_close: Optional[float] = None # NEW: Store previous day's close for gap_pct
 
         # Active trade details
         self.active_trade_id: Optional[int] = None 
@@ -333,6 +336,15 @@ class TradingStateMachine:
         self.current_regime: str = "unknown"
         self.current_candidate_id: str = "default"
         self.current_strategy_type: str = "ORB" # NEW: Store current strategy type
+
+        # Indicator values for logging/regime classification
+        self.last_atr_pct: float = 0.0
+        self.last_gap_pct: float = 0.0
+        self.last_rel_volume: float = 0.0
+        self.last_rsi_value: Optional[float] = None
+        self.last_short_sma: Optional[float] = None
+        self.last_long_sma: Optional[float] = None
+        self.last_market_trend: str = "sideways"
 
     def reset_daily_state(self):
         self.orb_high = 0.0
@@ -351,6 +363,10 @@ class TradingStateMachine:
         self.current_strategy_type = "ORB" # Reset to default strategy type
         self.bars.clear()
         self.closes.clear()
+        self.volumes.clear()
+        # self.previous_day_close should ideally be fetched from historical data
+        # For now, it will remain None until a proper historical data fetch is implemented.
+        # logger.info(f"RESET {self.ticker}") # Logged in check_daily_reset
 
     def check_daily_reset(self):
         today = datetime.now().date()
@@ -367,17 +383,28 @@ class TradingStateMachine:
         if len(self.closes) < period + 1:
             return None
         
-        # Simplified RSI calculation for demonstration
-        # Real RSI needs more robust average gain/loss calculation
-        deltas = [self.closes[i] - self.closes[i-1] for i in range(1, len(self.closes))]
-        gains = [d for d in deltas if d > 0]
-        losses = [abs(d) for d in deltas if d < 0]
+        # Proper RSI calculation using rolling average gain/loss
+        gains = deque(maxlen=period)
+        losses = deque(maxlen=period)
 
-        avg_gain = sum(gains[-period:]) / period if gains else 0
-        avg_loss = sum(losses[-period:]) / period if losses else 0
+        for i in range(1, len(self.closes)):
+            delta = self.closes[i] - self.closes[i-1]
+            if delta > 0:
+                gains.append(delta)
+                losses.append(0)
+            else:
+                losses.append(abs(delta))
+                gains.append(0)
+        
+        # Ensure we have enough data for the period
+        if len(gains) < period:
+            return None
+
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
 
         if avg_loss == 0:
-            return 100.0 if avg_gain > 0 else 50.0
+            return 100.0 if avg_gain > 0 else 50.0 # Avoid division by zero
         
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
@@ -387,47 +414,108 @@ class TradingStateMachine:
         if len(self.bars) < period:
             return None
         
-        # Simplified ATR calculation
-        tr_sum = 0.0
+        # ATR calculation using True Range
+        true_ranges = []
         for i in range(1, period + 1):
             current_bar = self.bars[-i]
-            previous_bar = self.bars[-(i+1)] if len(self.bars) > i else None
+            previous_bar_close = self.bars[-(i+1)].close if len(self.bars) > i else current_bar.close # Use current close if no previous bar
             
             high_low = current_bar.high - current_bar.low
-            high_prev_close = abs(current_bar.high - (previous_bar.close if previous_bar else current_bar.close))
-            low_prev_close = abs(current_bar.low - (previous_bar.close if previous_bar else current_bar.close))
+            high_prev_close = abs(current_bar.high - previous_bar_close)
+            low_prev_close = abs(current_bar.low - previous_bar_close)
             
             tr = max(high_low, high_prev_close, low_prev_close)
-            tr_sum += tr
+            true_ranges.append(tr)
             
-        atr = tr_sum / period
+        atr = sum(true_ranges) / period
         return (atr / self.bars[-1].close * 100) if self.bars[-1].close > 0 else 0.0
+
+    def _calculate_gap_pct(self, current_open: float) -> float:
+        if self.previous_day_close is None or self.previous_day_close == 0:
+            return 0.0 # Cannot calculate gap without previous day's close
+        return (current_open - self.previous_day_close) / self.previous_day_close * 100
+
+    def _calculate_rel_volume(self, current_volume: float, period: int = 20) -> float:
+        if len(self.volumes) < period or sum(self.volumes) == 0: # Ensure enough data and non-zero average
+            return 1.0 # Default to 1.0 if not enough history
+        
+        avg_volume = sum(list(self.volumes)[-period:]) / period
+        return (current_volume / avg_volume) if avg_volume > 0 else 1.0
 
     async def process_minute_bar(self, bar: Bar):
         self.check_daily_reset()
+        bar_time_et = convert_utc_to_et(bar.timestamp).time()
+        current_et_datetime = convert_utc_to_et(bar.timestamp)
+
+        # NEW: Update previous_day_close at the end of the market day
+        if bar_time_et >= self.market_close_et and self.previous_day_close is None: # Only set once per day
+            self.previous_day_close = bar.close
+            logger.info(f"END OF DAY {self.ticker} | Stored previous day close: ${self.previous_day_close:.2f}")
+
+        # NEW: Market hours check for trading logic (ORB range building is pre-market/early market)
+        if not (self.market_open_et <= bar_time_et <= self.market_close_et):
+            # NEW: Overnight position management - close any open positions at market close
+            if self.position_taken and self.active_trade_order_id and bar_time_et >= self.market_close_et:
+                logger.warning(f"MARKET CLOSE | Closing open position for {self.ticker} due to market close.")
+                # Simulate market order close at current_price
+                exit_price = bar.close
+                pnl = (exit_price - self.active_trade_entry_price) * self.active_trade_qty
+                self.trader.logger_obj.update_exit_details(
+                    self.active_trade_order_id,
+                    exit_price,
+                    pnl,
+                    bar.timestamp
+                )
+                # Log trade features after trade closure
+                if self.active_trade_id and self.current_regime and self.current_candidate_id and self.current_strategy_type:
+                    orb_width_pct = (self.orb_high - self.orb_low) / self.orb_low * 100 if self.orb_low > 0 else 0
+                    self.adaptive_learner.log_trade_features(
+                        trade_id=self.active_trade_id,
+                        ticker=self.ticker,
+                        regime=self.current_regime,
+                        candidate_id=self.current_candidate_id,
+                        strategy_type=self.current_strategy_type,
+                        orb_width_pct=orb_width_pct,
+                        gap_pct=self.last_gap_pct,
+                        rel_volume=self.last_rel_volume,
+                        atr_pct=self.last_atr_pct,
+                        market_trend=self.last_market_trend,
+                        rsi_value=self.last_rsi_value,
+                        short_sma=self.last_short_sma,
+                        long_sma=self.last_long_sma,
+                    )
+                self.position_taken = False
+                self.active_trade_id = None 
+                self.active_trade_order_id = None 
+                self.active_trade_entry_price = 0.0
+                self.active_trade_sl_price = 0.0
+                self.active_trade_tp_price = 0.0
+                self.active_trade_qty = 0
+                self.current_regime = "unknown"
+                self.current_candidate_id = "default"
+                self.current_strategy_type = "ORB"
+            return # Do not process bars outside market hours
+
         self.bars.append(bar)
         self.closes.append(bar.close)
-        bar_time_et = convert_utc_to_et(bar.timestamp).time()
+        self.volumes.append(bar.volume) # NEW: Append volume
 
-        # Calculate indicators for regime classification
-        short_sma_val = self._calculate_sma(20) # Example short SMA
-        long_sma_val = self._calculate_sma(50)  # Example long SMA
-        rsi_val = self._calculate_rsi(14)       # Example RSI
-        atr_pct_val = self._calculate_atr_pct(14) # Example ATR
+        # Calculate indicators for regime classification (only if enough data)
+        self.last_short_sma = self._calculate_sma(20) # Example short SMA
+        self.last_long_sma = self._calculate_sma(50)  # Example long SMA
+        self.last_rsi_value = self._calculate_rsi(14)       # Example RSI
+        self.last_atr_pct = self._calculate_atr_pct(14) # Example ATR
+        self.last_gap_pct = self._calculate_gap_pct(bar.open) # NEW: Calculate gap_pct
+        self.last_rel_volume = self._calculate_rel_volume(bar.volume) # NEW: Calculate rel_volume
         
-        # Placeholder for gap_pct and rel_volume - needs previous day/bar data
-        gap_pct_val = 0.0 
-        rel_volume_val = 1.0 
-        market_trend_val = "sideways" # Placeholder
-
         # Determine market trend for regime classification
-        if short_sma_val and long_sma_val:
-            if short_sma_val > long_sma_val * 1.001: # Short > Long by 0.1%
-                market_trend_val = "up"
-            elif short_sma_val < long_sma_val * 0.999: # Short < Long by 0.1%
-                market_trend_val = "down"
+        if self.last_short_sma and self.last_long_sma:
+            if self.last_short_sma > self.last_long_sma * 1.001: # Short > Long by 0.1%
+                self.last_market_trend = "up"
+            elif self.last_short_sma < self.last_long_sma * 0.999: # Short < Long by 0.1%
+                self.last_market_trend = "down"
             else:
-                market_trend_val = "sideways"
+                self.last_market_trend = "sideways"
 
         # During ORB range building
         if self.market_open_et <= bar_time_et < self.range_end_et:
@@ -440,7 +528,7 @@ class TradingStateMachine:
             self.range_established = True
             logger.info(f"LOCKED {self.ticker} | ${self.orb_low:.2f}-${self.orb_high:.2f}")
 
-        # Check for position closure if a position is active
+        # Check for position closure if a position is active (during market hours)
         if self.position_taken and self.active_trade_order_id:
             exit_price = None
             pnl = 0.0
@@ -469,13 +557,13 @@ class TradingStateMachine:
                         candidate_id=self.current_candidate_id,
                         strategy_type=self.current_strategy_type, # NEW
                         orb_width_pct=orb_width_pct,
-                        gap_pct=gap_pct_val,
-                        rel_volume=rel_volume_val,
-                        atr_pct=atr_pct_val,
-                        market_trend=market_trend_val,
-                        rsi_value=rsi_val,
-                        short_sma=short_sma_val,
-                        long_sma=long_sma_val,
+                        gap_pct=self.last_gap_pct,
+                        rel_volume=self.last_rel_volume,
+                        atr_pct=self.last_atr_pct,
+                        market_trend=self.last_market_trend,
+                        rsi_value=self.last_rsi_value,
+                        short_sma=self.last_short_sma,
+                        long_sma=self.last_long_sma,
                     )
 
                 self.position_taken = False
@@ -494,9 +582,11 @@ class TradingStateMachine:
         if not self.position_taken:
             # Classify regime and select adaptive config
             self.current_regime = self.adaptive_learner.classify_regime(
-                ticker=self.ticker, current_price=bar.close, orb_width_pct=(self.orb_high - self.orb_low) / self.orb_low * 100 if self.orb_low > 0 else 0,
-                gap_pct=gap_pct_val, atr_pct=atr_pct_val, rel_volume=rel_volume_val,
-                rsi_value=rsi_val, short_sma=short_sma_val, long_sma=long_sma_val, market_trend=market_trend_val
+                ticker=self.ticker, current_price=bar.close, 
+                orb_width_pct=(self.orb_high - self.orb_low) / self.orb_low * 100 if self.orb_low > 0 else 0,
+                gap_pct=self.last_gap_pct, atr_pct=self.last_atr_pct, rel_volume=self.last_rel_volume,
+                rsi_value=self.last_rsi_value, short_sma=self.last_short_sma, long_sma=self.last_long_sma, 
+                market_trend=self.last_market_trend
             )
             
             adaptive_config_dict, candidate_id, strategy_type, stats = self.adaptive_learner.select_candidate(
@@ -517,14 +607,27 @@ class TradingStateMachine:
                         self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
                     )
             elif self.current_strategy_type == "SMA_CROSS":
-                if short_sma_val and long_sma_val and short_sma_val > long_sma_val and self.bars[-2].close * (1 - adaptive_config_dict["short_sma_period"]/1000) <= self.bars[-2].close * (1 - adaptive_config_dict["long_sma_period"]/1000): # Simple cross check
-                    logger.info(f"SMA CROSSOVER {self.ticker} @ ${bar.close:.2f}")
-                    order_details = await asyncio.to_thread(
-                        self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
-                    )
+                # NEW: Correct SMA Crossover logic
+                if len(self.closes) >= max(adaptive_config_dict.get("short_sma_period", 0), adaptive_config_dict.get("long_sma_period", 0)) + 1:
+                    prev_short_sma = self._calculate_sma(adaptive_config_dict["short_sma_period"]) # SMA for previous bar
+                    prev_long_sma = self._calculate_sma(adaptive_config_dict["long_sma_period"]) # SMA for previous bar
+                    
+                    # Recalculate SMAs for current bar (using current self.closes)
+                    current_short_sma = self._calculate_sma(adaptive_config_dict["short_sma_period"])
+                    current_long_sma = self._calculate_sma(adaptive_config_dict["long_sma_period"])
+
+                    if (prev_short_sma is not None and prev_long_sma is not None and
+                        current_short_sma is not None and current_long_sma is not None and
+                        prev_short_sma <= prev_long_sma and current_short_sma > current_long_sma): # Bullish crossover
+                        logger.info(f"SMA CROSSOVER {self.ticker} @ ${bar.close:.2f} (Short: {current_short_sma:.2f}, Long: {current_long_sma:.2f})")
+                        order_details = await asyncio.to_thread(
+                            self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
+                        )
             elif self.current_strategy_type == "RSI_MR":
-                if rsi_val is not None and rsi_val < adaptive_config_dict.get("oversold_level", 30):
-                    logger.info(f"RSI OVERSOLD {self.ticker} @ ${bar.close:.2f} (RSI: {rsi_val})")
+                rsi_period = adaptive_config_dict.get("rsi_period", 14)
+                oversold_level = adaptive_config_dict.get("oversold_level", 30)
+                if self.last_rsi_value is not None and self.last_rsi_value < oversold_level:
+                    logger.info(f"RSI OVERSOLD {self.ticker} @ ${bar.close:.2f} (RSI: {self.last_rsi_value})")
                     order_details = await asyncio.to_thread(
                         self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
                     )
@@ -539,6 +642,8 @@ class TradingStateMachine:
                 self.active_trade_qty = order_details["quantity"]
             else:
                 # Only log warning if a strategy was selected but no order was placed due to internal logic
+                # ORB strategy might not trigger if range not established or price not above high
+                # SMA/RSI might not trigger if conditions not met
                 if self.current_strategy_type != "ORB" or (self.range_established and bar.close > self.orb_high):
                     logger.warning(f"Order submission failed for {self.ticker} with strategy {self.current_strategy_type}")
 

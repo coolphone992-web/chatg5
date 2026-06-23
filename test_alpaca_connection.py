@@ -1,4 +1,3 @@
-"""Quick test to verify Alpaca API connection with credentials from .env"""
 import os
 from dotenv import load_dotenv
 
@@ -14,7 +13,7 @@ print(f"Endpoint: {API_ENDPOINT}")
 
 try:
     from alpaca.trading.client import TradingClient
-    # The raw=True parameter is needed for the newer alpaca-py versions with paper endpoint
+    # The paper=True parameter is needed for the newer alpaca-py versions with paper endpoint
     client = TradingClient(API_KEY, SECRET_KEY, paper=True)
     account = client.get_account()
     print(f"\nSUCCESS - Connected to Alpaca (Paper Trading)")

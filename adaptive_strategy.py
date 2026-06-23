@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
@@ -13,16 +13,47 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CandidateConfig:
     candidate_id: str
-    stop_loss_cents: int
-    risk_reward_ratio: float
-    position_size_multiplier: float
+    strategy_type: str # e.g., "ORB", "SMA_CROSS", "RSI_MR"
+    
+    # Common parameters
+    position_size_multiplier: float = 1.0
+    risk_per_trade_usd: float = 50.0 # Max USD to risk per trade
+    
+    # Stop Loss / Take Profit (percentage based for flexibility)
+    stop_loss_pct: float = 0.002 # 0.2% of entry price
+    take_profit_rr: float = 2.0 # Risk-reward ratio (for ORB/SMA Cross)
+    take_profit_pct: Optional[float] = None # Absolute % target (for RSI MR)
+
+    # ORB specific
+    orb_sl_cents: Optional[int] = None # Original ORB absolute cents SL (if preferred)
+
+    # SMA Crossover specific
+    short_sma_period: Optional[int] = None
+    long_sma_period: Optional[int] = None
+
+    # RSI Mean Reversion specific
+    rsi_period: Optional[int] = None
+    oversold_level: Optional[int] = None
+    overbought_level: Optional[int] = None
 
 
 DEFAULT_CANDIDATES: List[CandidateConfig] = [
-    CandidateConfig("base", 10, 2.0, 1.0),
-    CandidateConfig("wide_rr", 15, 2.5, 0.8),
-    CandidateConfig("tight_fast", 8, 1.8, 1.0),
-    CandidateConfig("defensive", 12, 1.5, 0.7),
+    # --- ORB Strategy Candidates ---
+    CandidateConfig("orb_base_2_1", "ORB", stop_loss_pct=0.002, take_profit_rr=2.0, position_size_multiplier=1.0),
+    CandidateConfig("orb_tight_3_1", "ORB", stop_loss_pct=0.0015, take_profit_rr=3.0, position_size_multiplier=0.8),
+    CandidateConfig("orb_wide_1_5_1", "ORB", stop_loss_pct=0.003, take_profit_rr=1.5, position_size_multiplier=1.2),
+
+    # --- SMA Crossover Strategy Candidates ---
+    CandidateConfig("sma_5_20_trend", "SMA_CROSS", short_sma_period=5, long_sma_period=20, 
+                    stop_loss_pct=0.005, take_profit_rr=2.5, position_size_multiplier=0.7),
+    CandidateConfig("sma_10_50_swing", "SMA_CROSS", short_sma_period=10, long_sma_period=50, 
+                    stop_loss_pct=0.01, take_profit_rr=2.0, position_size_multiplier=0.6),
+
+    # --- RSI Mean Reversion Strategy Candidates ---
+    CandidateConfig("rsi_14_oversold", "RSI_MR", rsi_period=14, oversold_level=30, overbought_level=70, 
+                    stop_loss_pct=0.003, take_profit_pct=0.005, position_size_multiplier=0.9),
+    CandidateConfig("rsi_7_extreme", "RSI_MR", rsi_period=7, oversold_level=20, overbought_level=80, 
+                    stop_loss_pct=0.002, take_profit_pct=0.003, position_size_multiplier=1.1),
 ]
 
 
@@ -59,9 +90,18 @@ class AdaptiveLearner:
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS strategy_candidates (
             candidate_id TEXT PRIMARY KEY,
-            stop_loss_cents INTEGER NOT NULL,
-            risk_reward_ratio REAL NOT NULL,
+            strategy_type TEXT NOT NULL,
             position_size_multiplier REAL NOT NULL,
+            risk_per_trade_usd REAL NOT NULL,
+            stop_loss_pct REAL NOT NULL,
+            take_profit_rr REAL,
+            take_profit_pct REAL,
+            short_sma_period INTEGER,
+            long_sma_period INTEGER,
+            rsi_period INTEGER,
+            oversold_level INTEGER,
+            overbought_level INTEGER,
+            orb_sl_cents INTEGER,
             enabled INTEGER NOT NULL DEFAULT 1
         )
         """)
@@ -71,11 +111,15 @@ class AdaptiveLearner:
             ticker TEXT NOT NULL,
             regime TEXT NOT NULL,
             candidate_id TEXT NOT NULL,
+            strategy_type TEXT NOT NULL, -- NEW: Store strategy type
             orb_width_pct REAL,
             gap_pct REAL,
             rel_volume REAL,
             atr_pct REAL,
             market_trend TEXT,
+            rsi_value REAL, -- NEW: RSI value at trade entry
+            short_sma REAL, -- NEW: Short SMA value at trade entry
+            long_sma REAL,  -- NEW: Long SMA value at trade entry
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
@@ -85,37 +129,73 @@ class AdaptiveLearner:
         for c in candidates:
             self.conn.execute("""
             INSERT OR IGNORE INTO strategy_candidates
-            (candidate_id, stop_loss_cents, risk_reward_ratio, position_size_multiplier, enabled)
-            VALUES (?, ?, ?, ?, 1)
+            (candidate_id, strategy_type, position_size_multiplier, risk_per_trade_usd, stop_loss_pct, 
+             take_profit_rr, take_profit_pct, short_sma_period, long_sma_period, rsi_period, 
+             oversold_level, overbought_level, orb_sl_cents, enabled)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """, (
-                c.candidate_id,
-                c.stop_loss_cents,
-                c.risk_reward_ratio,
-                c.position_size_multiplier,
+                c.candidate_id, c.strategy_type, c.position_size_multiplier, c.risk_per_trade_usd, c.stop_loss_pct,
+                c.take_profit_rr, c.take_profit_pct, c.short_sma_period, c.long_sma_period, c.rsi_period,
+                c.oversold_level, c.overbought_level, c.orb_sl_cents
             ))
         self.conn.commit()
 
     def classify_regime(
         self,
-        atr_pct: float,
+        ticker: str,
+        current_price: float,
+        orb_width_pct: float,
         gap_pct: float,
-        market_above_ma: bool,
+        atr_pct: float,
         rel_volume: float,
+        rsi_value: Optional[float],
+        short_sma: Optional[float],
+        long_sma: Optional[float],
+        market_trend: str, # e.g., "up", "down", "sideways"
     ) -> str:
         """
-        Simple first-pass regime classifier.
+        Classifies the current market regime based on various indicators.
+        This is a simplified example; real-world classification can be more complex.
         """
-        if atr_pct >= 2.0 or abs(gap_pct) >= 1.0:
-            return "high_vol_trend" if market_above_ma else "high_vol_range"
-        if rel_volume >= 1.2 and market_above_ma:
-            return "trend"
-        if atr_pct < 1.0 and rel_volume < 1.0:
-            return "quiet_range"
-        return "range"
+        regime = "unknown"
+
+        # High Volatility / Gap Play
+        if atr_pct >= 2.0 or abs(gap_pct) >= 1.5: # ATR 2% or gap 1.5%
+            return "high_vol_gap" if market_trend == "up" else "high_vol_gap_down"
+
+        # Trend Following Regimes
+        if market_trend == "up":
+            if short_sma is not None and long_sma is not None and short_sma > long_sma and rel_volume > 1.2:
+                regime = "strong_uptrend_sma_cross"
+            elif rel_volume > 1.0 and orb_width_pct > 0.5: # Strong ORB breakout potential
+                regime = "uptrend_orb_momentum"
+            else:
+                regime = "general_uptrend"
+        elif market_trend == "down":
+            if short_sma is not None and long_sma is not None and short_sma < long_sma and rel_volume > 1.2:
+                regime = "strong_downtrend_sma_cross"
+            else:
+                regime = "general_downtrend"
+        
+        # Mean Reversion Regimes (within a range or slight trend)
+        if regime == "unknown" or "range" in regime:
+            if rsi_value is not None:
+                if rsi_value < 30 and market_trend != "down": # Oversold, not in strong downtrend
+                    regime = "oversold_bounce"
+                elif rsi_value > 70 and market_trend != "up": # Overbought, not in strong uptrend
+                    regime = "overbought_fade"
+                elif atr_pct < 0.8 and rel_volume < 0.8: # Low vol, low momentum
+                    regime = "quiet_range"
+                else:
+                    regime = "general_range"
+        
+        return regime
 
     def get_enabled_candidates(self) -> List[CandidateConfig]:
         rows = self.conn.execute("""
-        SELECT candidate_id, stop_loss_cents, risk_reward_ratio, position_size_multiplier
+        SELECT candidate_id, strategy_type, position_size_multiplier, risk_per_trade_usd, stop_loss_pct, 
+               take_profit_rr, take_profit_pct, short_sma_period, long_sma_period, rsi_period, 
+               oversold_level, overbought_level, orb_sl_cents
         FROM strategy_candidates
         WHERE enabled = 1
         ORDER BY candidate_id
@@ -123,9 +203,18 @@ class AdaptiveLearner:
         return [
             CandidateConfig(
                 candidate_id=row["candidate_id"],
-                stop_loss_cents=row["stop_loss_cents"],
-                risk_reward_ratio=row["risk_reward_ratio"],
+                strategy_type=row["strategy_type"],
                 position_size_multiplier=row["position_size_multiplier"],
+                risk_per_trade_usd=row["risk_per_trade_usd"],
+                stop_loss_pct=row["stop_loss_pct"],
+                take_profit_rr=row["take_profit_rr"],
+                take_profit_pct=row["take_profit_pct"],
+                short_sma_period=row["short_sma_period"],
+                long_sma_period=row["long_sma_period"],
+                rsi_period=row["rsi_period"],
+                oversold_level=row["oversold_level"],
+                overbought_level=row["overbought_level"],
+                orb_sl_cents=row["orb_sl_cents"],
             )
             for row in rows
         ]
@@ -136,26 +225,34 @@ class AdaptiveLearner:
         ticker: str,
         regime: str,
         candidate_id: str,
-        orb_width_pct: float,
-        gap_pct: float,
-        rel_volume: float,
-        atr_pct: float,
-        market_trend: str,
+        strategy_type: str, # NEW: Strategy type
+        orb_width_pct: Optional[float],
+        gap_pct: Optional[float],
+        rel_volume: Optional[float],
+        atr_pct: Optional[float],
+        market_trend: Optional[str],
+        rsi_value: Optional[float] = None, # NEW: RSI value at trade entry
+        short_sma: Optional[float] = None, # NEW: Short SMA value at trade entry
+        long_sma: Optional[float] = None,  # NEW: Long SMA value at trade entry
     ) -> None:
         self.conn.execute("""
         INSERT OR REPLACE INTO trade_features
-        (trade_id, ticker, regime, candidate_id, orb_width_pct, gap_pct, rel_volume, atr_pct, market_trend)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (trade_id, ticker, regime, candidate_id, strategy_type, orb_width_pct, gap_pct, rel_volume, atr_pct, market_trend, rsi_value, short_sma, long_sma)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade_id,
             ticker,
             regime,
             candidate_id,
+            strategy_type,
             orb_width_pct,
             gap_pct,
             rel_volume,
             atr_pct,
             market_trend,
+            rsi_value,
+            short_sma,
+            long_sma,
         ))
         self.conn.commit()
 
@@ -229,16 +326,18 @@ class AdaptiveLearner:
         ticker: str,
         regime: str,
         default_config: Dict,
-    ) -> Tuple[Dict, str, Dict[str, Dict[str, float]]]:
+    ) -> Tuple[Dict, str, str, Dict[str, Dict[str, float]]]: # NEW: Return strategy_type
         """
         Returns:
-        - chosen config dict
+        - chosen config dict (merged with default_config)
         - candidate_id
+        - strategy_type (NEW)
         - stats for inspection/logging
         """
         candidates = self.get_enabled_candidates()
         if not candidates:
-            return default_config, "default", {}
+            # If no candidates, return a default config with a default strategy type
+            return default_config, "default", "ORB", {}
 
         stats_map: Dict[str, Dict[str, float]] = {}
         total_obs = 1
@@ -258,21 +357,25 @@ class AdaptiveLearner:
             for c in candidates:
                 s = stats_map[c.candidate_id]
                 # UCB-style exploration bonus for low-sample configs
-                exploration_bonus = math.sqrt(math.log(total_obs + 1) / (s["n"] + 1))
+                exploration_bonus = math.sqrt(math.log(total_obs + 1) / (s["n"] + 1)) if s["n"] > 0 else 1.0 # Give new configs a boost
                 adjusted_score = s["score"] + exploration_bonus
 
                 # Don't promote weak configs too early unless all are low-sample
                 if s["n"] < self.min_trades_before_promote:
-                    adjusted_score -= 0.25
+                    adjusted_score -= 0.25 # Penalty for insufficient data
 
                 if adjusted_score > best_score:
                     best_score = adjusted_score
                     chosen = c
 
+        # Merge chosen candidate config with default config to ensure all base parameters are present
         learned_config = {
             **default_config,
-            "stop_loss_cents": chosen.stop_loss_cents,
-            "risk_reward_ratio": chosen.risk_reward_ratio,
-            "position_size_multiplier": chosen.position_size_multiplier,
+            **asdict(chosen) # Convert dataclass to dict and merge
         }
-        return learned_config, chosen.candidate_id, stats_map
+        # Remove dataclass-specific fields that shouldn't be in the final config dict
+        learned_config.pop("candidate_id", None)
+        learned_config.pop("strategy_type", None)
+        learned_config.pop("enabled", None)
+
+        return learned_config, chosen.candidate_id, chosen.strategy_type, stats_map

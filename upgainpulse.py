@@ -5,7 +5,8 @@ import math
 import threading
 import logging
 from datetime import datetime, time, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Deque
+from collections import deque
 from pytz import timezone
 from dotenv import load_dotenv
 
@@ -17,7 +18,7 @@ from alpaca.trading.errors import APIError
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 
-from adaptive_strategy import AdaptiveLearner, CandidateConfig # NEW: Import AdaptiveLearner
+from adaptive_strategy import AdaptiveLearner, CandidateConfig, DEFAULT_CANDIDATES # NEW: Import AdaptiveLearner and CandidateConfig
 
 # =============================================================================
 # LOGGING SETUP
@@ -63,16 +64,17 @@ class ConfigError(Exception):
 def validate_config(config: Dict) -> None:
     """Validate trading configuration parameters."""
     try:
+        # These are base config values, individual candidates will override/add
         risk = float(config.get("risk_per_trade_usd", 50.0))
-        sl_cents = float(config.get("stop_loss_cents", 10))
+        sl_pct = float(config.get("stop_loss_pct", 0.002)) # Default to percentage
         multiplier = float(config.get("position_size_multiplier", 1.0))
         rr_ratio = float(config.get("risk_reward_ratio", 2.0))
-        account_capital = float(config.get("account_capital", 0.0)) # Ensure account_capital is checked
+        account_capital = float(config.get("account_capital", 0.0)) 
 
         if risk <= 0:
             raise ConfigError("risk_per_trade_usd must be > 0")
-        if sl_cents <= 0:
-            raise ConfigError("stop_loss_cents must be > 0")
+        if sl_pct <= 0:
+            raise ConfigError("stop_loss_pct must be > 0")
         if multiplier <= 0:
             raise ConfigError("position_size_multiplier must be > 0")
         if rr_ratio <= 0:
@@ -82,14 +84,14 @@ def validate_config(config: Dict) -> None:
         if account_capital <= 0:
             logger.warning("account_capital not set or <= 0. Using available buying power as cap.")
 
-        logger.info(f"Config validated: risk=${risk}, SL={sl_cents}c, multiplier={multiplier}x, RR={rr_ratio}:1")
+        logger.info(f"Base Config validated: risk=${risk}, SL={sl_pct*100:.2f}%, multiplier={multiplier}x, RR={rr_ratio}:1")
     except (TypeError, ValueError) as e:
         raise ConfigError(f"Config type error: {e}")
 
 def calculate_position_size(current_price: float, config: Dict, available_buying_power: float) -> int:
     """
-    Correct position sizing:
-    1) Size from risk per share
+    Correct position sizing based on percentage stop loss.
+    1) Size from risk per trade (using percentage stop loss)
     2) Cap by configured account capital
     3) Cap by live available buying power
     """
@@ -97,15 +99,19 @@ def calculate_position_size(current_price: float, config: Dict, available_buying
         return 0
 
     risk_per_trade = float(config.get("risk_per_trade_usd", 50.0))
-    stop_loss_cents = float(config.get("stop_loss_cents", 10))
+    stop_loss_pct = float(config.get("stop_loss_pct", 0.002)) # Use percentage stop loss
     multiplier = float(config.get("position_size_multiplier", 1.0))
     account_capital = float(config.get("account_capital", available_buying_power)) # Use BP if not set
 
-    stop_loss_dollars = stop_loss_cents / 100.0
-    if stop_loss_dollars <= 0:
+    if stop_loss_pct <= 0:
         return 0
 
-    qty_by_risk = math.floor((risk_per_trade / stop_loss_dollars) * multiplier)
+    # Calculate stop loss in dollars per share
+    stop_loss_dollars_per_share = current_price * stop_loss_pct
+    if stop_loss_dollars_per_share <= 0:
+        return 0
+
+    qty_by_risk = math.floor((risk_per_trade / stop_loss_dollars_per_share) * multiplier)
     qty_by_config_capital = math.floor(account_capital / current_price)
     qty_by_buying_power = math.floor(available_buying_power / current_price)
 
@@ -133,7 +139,7 @@ class TradeLogger:
         with self.lock:
             conn = self._get_connection()
             cursor = conn.cursor()
-            # MODIFIED: Added regime and candidate_id columns
+            # MODIFIED: Added regime, candidate_id, and strategy_type columns
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +157,7 @@ class TradeLogger:
                     pnl REAL,
                     regime TEXT,           -- NEW: Market regime at time of trade
                     candidate_id TEXT,     -- NEW: ID of the candidate config used
+                    strategy_type TEXT,    -- NEW: Type of strategy used (ORB, SMA_CROSS, RSI_MR)
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -158,19 +165,20 @@ class TradeLogger:
             logger.info("Trade database initialized")
  
     def log_entry(self, ticker: str, setup_type: str, entry_price: float, qty: int, sl: float, tp: float, 
-                  order_id: Optional[str] = None, regime: Optional[str] = None, candidate_id: Optional[str] = None) -> None:
+                  order_id: Optional[str] = None, regime: Optional[str] = None, 
+                  candidate_id: Optional[str] = None, strategy_type: Optional[str] = None) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self.lock:
             conn = self._get_connection()
             cursor = conn.cursor()
             try:
-                # MODIFIED: Added regime and candidate_id to insert statement
+                # MODIFIED: Added regime, candidate_id, and strategy_type to insert statement
                 cursor.execute('''
-                    INSERT INTO trades (timestamp_entry, ticker, setup_type, entry_price, quantity, stop_loss, take_profit, status, order_id, regime, candidate_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (timestamp, ticker, setup_type, entry_price, qty, sl, tp, 'OPEN', order_id, regime, candidate_id))
+                    INSERT INTO trades (timestamp_entry, ticker, setup_type, entry_price, quantity, stop_loss, take_profit, status, order_id, regime, candidate_id, strategy_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, ticker, setup_type, entry_price, qty, sl, tp, 'OPEN', order_id, regime, candidate_id, strategy_type))
                 conn.commit()
-                logger.info(f"OPEN | {ticker} ${entry_price:.2f} x{qty} | SL ${sl:.2f} | TP ${tp:.2f} | Order: {order_id} | Regime: {regime} | Config: {candidate_id}")
+                logger.info(f"OPEN | {ticker} ${entry_price:.2f} x{qty} | SL ${sl:.2f} | TP ${tp:.2f} | Order: {order_id} | Regime: {regime} | Config: {candidate_id} | Strategy: {strategy_type}")
             except sqlite3.Error as e:
                 logger.error(f"DB insert error: {e}")
 
@@ -213,7 +221,7 @@ class AccountValidator:
         return True
 
 # =============================================================================
-# ALPACA PAPER TRADER
+# ALPACA PAPER TRADER - MODIFIED FOR ADAPTIVE LAYER
 # =============================================================================
 class AlpacaPaperTrader:
     def __init__(self, api_key: str, secret_key: str, logger_obj: TradeLogger, account_validator: AccountValidator):
@@ -223,7 +231,7 @@ class AlpacaPaperTrader:
         self.last_order_time = {}
         self.order_cooldown = 1.0 # seconds
 
-    def execute_orb_setup(self, ticker: str, current_price: float, config: Dict) -> Optional[Dict]:
+    def execute_trade_setup(self, ticker: str, current_price: float, config: Dict) -> Optional[Dict]: # RENAMED
         now = datetime.now().timestamp()
         last_time = self.last_order_time.get(ticker, 0)
         if now - last_time < self.order_cooldown:
@@ -231,9 +239,11 @@ class AlpacaPaperTrader:
 
         try:
             risk = float(config.get("risk_per_trade_usd", 50.0))
-            stop_loss_cents = float(config.get("stop_loss_cents", 10))
+            stop_loss_pct = float(config.get("stop_loss_pct", 0.002)) # Expect percentage stop loss
             multiplier = float(config.get("position_size_multiplier", 1.0))
-            rr_ratio = float(config.get("risk_reward_ratio", 2.0))
+            rr_ratio = float(config.get("take_profit_rr", 2.0)) # Use RR for ORB/SMA
+            take_profit_pct = float(config.get("take_profit_pct", 0.0)) # Use absolute % for RSI
+            strategy_type = config.get("strategy_type", "UNKNOWN")
 
             available_bp = self.validator.get_buying_power()
             if available_bp <= 0:
@@ -244,14 +254,29 @@ class AlpacaPaperTrader:
             if qty <= 0:
                 logger.error(
                     f"Qty calc failed | ticker={ticker} | price=${current_price:.2f} | "
-                    f"risk=${risk:.2f} | stop=${stop_loss_cents:.2f} | bp=${available_bp:.2f}"
+                    f"risk=${risk:.2f} | stop_pct={stop_loss_pct*100:.2f}% | bp=${available_bp:.2f}"
                 )
                 return None
 
-            logger.info(f"SIZING {ticker} | qty={qty} | required_capital=${current_price * qty:.2f} | risk=${risk:.2f} | stop=${stop_loss_cents:.2f} | rr={rr_ratio:.2f}")
+            # Calculate SL and TP prices based on strategy type
+            sl_price = round(current_price * (1 - stop_loss_pct), 2)
+            tp_price = 0.0
 
-            sl_price = round(current_price - (stop_loss_cents / 100.0), 2)
-            tp_price = round(current_price + ((stop_loss_cents / 100.0) * rr_ratio), 2)
+            if strategy_type == "RSI_MR" and take_profit_pct > 0:
+                tp_price = round(current_price * (1 + take_profit_pct), 2)
+            elif rr_ratio > 0: # Default to RR for ORB and SMA_CROSS
+                risk_dollars = current_price * stop_loss_pct
+                tp_price = round(current_price + (risk_dollars * rr_ratio), 2)
+            else:
+                logger.warning(f"Strategy {strategy_type} has no valid TP defined. Using default RR 2.0.")
+                risk_dollars = current_price * stop_loss_pct
+                tp_price = round(current_price + (risk_dollars * 2.0), 2)
+
+            if tp_price <= sl_price: # Ensure TP is above SL for long positions
+                logger.error(f"Invalid TP/SL for {ticker}: TP ${tp_price:.2f} <= SL ${sl_price:.2f}")
+                return None
+
+            logger.info(f"SIZING {ticker} | qty={qty} | required_capital=${current_price * qty:.2f} | risk=${risk:.2f} | SL_pct={stop_loss_pct*100:.2f}% | TP_pct={take_profit_pct*100:.2f}% | RR={rr_ratio:.2f}:1 | Strategy: {strategy_type}")
 
             order_data = MarketOrderRequest(
                 symbol=ticker, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
@@ -262,15 +287,17 @@ class AlpacaPaperTrader:
             order = self.client.submit_order(order_data)
             self.last_order_time[ticker] = now
             logger.info(f"ORDER {ticker} | {order.id}")
-            # MODIFIED: Added regime and candidate_id to log_entry
-            self.logger_obj.log_entry(ticker, "ORB_LONG", current_price, qty, sl_price, tp_price, order.id, 
-                                      regime=config.get("current_regime"), candidate_id=config.get("candidate_id"))
+            # MODIFIED: Added strategy_type, regime and candidate_id to log_entry
+            self.logger_obj.log_entry(ticker, strategy_type, current_price, qty, sl_price, tp_price, order.id, 
+                                      regime=config.get("current_regime"), candidate_id=config.get("candidate_id"),
+                                      strategy_type=strategy_type)
             return {
                 "order_id": order.id,
                 "entry_price": current_price,
                 "quantity": qty,
                 "stop_loss_price": sl_price,
                 "take_profit_price": tp_price,
+                "strategy_type": strategy_type # NEW: Return strategy type
             }
         except APIError as e:
             logger.error(f"API Error: {getattr(e, 'message', str(e))}")
@@ -280,27 +307,32 @@ class AlpacaPaperTrader:
             return None
 
 # =============================================================================
-# ORB STATE MACHINE - MODIFIED FOR ADAPTIVE LAYER
+# TRADING STATE MACHINE (FORMERLY ORB STATE MACHINE) - MODIFIED FOR ADAPTIVE LAYER
 # =============================================================================
-class ORBStateMachine:
-    def __init__(self, ticker: str, trader: AlpacaPaperTrader, config: Dict, adaptive_learner: AdaptiveLearner):
+class TradingStateMachine:
+    def __init__(self, ticker: str, trader: AlpacaPaperTrader, base_config: Dict, adaptive_learner: AdaptiveLearner):
         self.ticker = ticker
         self.trader = trader
-        self.config = config
-        self.adaptive_learner = adaptive_learner # NEW: AdaptiveLearner instance
+        self.base_config = base_config # Store base config, adaptive learner provides specific config
+        self.adaptive_learner = adaptive_learner
         self.market_open_et = time(9, 30)
         self.range_end_et = time(9, 45)
         self.reset_daily_state()
 
+        # Historical data for indicator calculation
+        self.bars: Deque[Bar] = deque(maxlen=50) # Store last 50 bars for SMA/RSI
+        self.closes: Deque[float] = deque(maxlen=50) # Store last 50 closes for SMA/RSI
+
         # Active trade details
-        self.active_trade_id: Optional[int] = None # NEW: Store internal trade ID for feature logging
+        self.active_trade_id: Optional[int] = None 
         self.active_trade_order_id: Optional[str] = None
         self.active_trade_entry_price: float = 0.0
         self.active_trade_sl_price: float = 0.0
         self.active_trade_tp_price: float = 0.0
         self.active_trade_qty: int = 0
-        self.current_regime: str = "unknown" # NEW: Store current regime
-        self.current_candidate_id: str = "default" # NEW: Store current candidate ID
+        self.current_regime: str = "unknown"
+        self.current_candidate_id: str = "default"
+        self.current_strategy_type: str = "ORB" # NEW: Store current strategy type
 
     def reset_daily_state(self):
         self.orb_high = 0.0
@@ -308,7 +340,7 @@ class ORBStateMachine:
         self.range_established = False
         self.position_taken = False
         self.last_reset_date = datetime.now().date()
-        self.active_trade_id = None # NEW: Reset internal trade ID
+        self.active_trade_id = None 
         self.active_trade_order_id = None
         self.active_trade_entry_price = 0.0
         self.active_trade_sl_price = 0.0
@@ -316,6 +348,9 @@ class ORBStateMachine:
         self.active_trade_qty = 0
         self.current_regime = "unknown"
         self.current_candidate_id = "default"
+        self.current_strategy_type = "ORB" # Reset to default strategy type
+        self.bars.clear()
+        self.closes.clear()
 
     def check_daily_reset(self):
         today = datetime.now().date()
@@ -323,9 +358,76 @@ class ORBStateMachine:
             self.reset_daily_state()
             logger.info(f"RESET {self.ticker}")
 
+    def _calculate_sma(self, period: int) -> Optional[float]:
+        if len(self.closes) < period:
+            return None
+        return sum(list(self.closes)[-period:]) / period
+
+    def _calculate_rsi(self, period: int) -> Optional[float]:
+        if len(self.closes) < period + 1:
+            return None
+        
+        # Simplified RSI calculation for demonstration
+        # Real RSI needs more robust average gain/loss calculation
+        deltas = [self.closes[i] - self.closes[i-1] for i in range(1, len(self.closes))]
+        gains = [d for d in deltas if d > 0]
+        losses = [abs(d) for d in deltas if d < 0]
+
+        avg_gain = sum(gains[-period:]) / period if gains else 0
+        avg_loss = sum(losses[-period:]) / period if losses else 0
+
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return round(rsi, 2)
+
+    def _calculate_atr_pct(self, period: int = 14) -> Optional[float]:
+        if len(self.bars) < period:
+            return None
+        
+        # Simplified ATR calculation
+        tr_sum = 0.0
+        for i in range(1, period + 1):
+            current_bar = self.bars[-i]
+            previous_bar = self.bars[-(i+1)] if len(self.bars) > i else None
+            
+            high_low = current_bar.high - current_bar.low
+            high_prev_close = abs(current_bar.high - (previous_bar.close if previous_bar else current_bar.close))
+            low_prev_close = abs(current_bar.low - (previous_bar.close if previous_bar else current_bar.close))
+            
+            tr = max(high_low, high_prev_close, low_prev_close)
+            tr_sum += tr
+            
+        atr = tr_sum / period
+        return (atr / self.bars[-1].close * 100) if self.bars[-1].close > 0 else 0.0
+
     async def process_minute_bar(self, bar: Bar):
         self.check_daily_reset()
+        self.bars.append(bar)
+        self.closes.append(bar.close)
         bar_time_et = convert_utc_to_et(bar.timestamp).time()
+
+        # Calculate indicators for regime classification
+        short_sma_val = self._calculate_sma(20) # Example short SMA
+        long_sma_val = self._calculate_sma(50)  # Example long SMA
+        rsi_val = self._calculate_rsi(14)       # Example RSI
+        atr_pct_val = self._calculate_atr_pct(14) # Example ATR
+        
+        # Placeholder for gap_pct and rel_volume - needs previous day/bar data
+        gap_pct_val = 0.0 
+        rel_volume_val = 1.0 
+        market_trend_val = "sideways" # Placeholder
+
+        # Determine market trend for regime classification
+        if short_sma_val and long_sma_val:
+            if short_sma_val > long_sma_val * 1.001: # Short > Long by 0.1%
+                market_trend_val = "up"
+            elif short_sma_val < long_sma_val * 0.999: # Short < Long by 0.1%
+                market_trend_val = "down"
+            else:
+                market_trend_val = "sideways"
 
         # During ORB range building
         if self.market_open_et <= bar_time_et < self.range_end_et:
@@ -357,86 +459,88 @@ class ORBStateMachine:
                     pnl,
                     bar.timestamp # Use bar timestamp for exit
                 )
-                # NEW: Log trade features after trade closure
-                if self.active_trade_id and self.current_regime and self.current_candidate_id:
-                    # Placeholder for actual feature values - you'll need to calculate these
+                # Log trade features after trade closure
+                if self.active_trade_id and self.current_regime and self.current_candidate_id and self.current_strategy_type:
                     orb_width_pct = (self.orb_high - self.orb_low) / self.orb_low * 100 if self.orb_low > 0 else 0
-                    gap_pct = 0.0 # Placeholder
-                    rel_volume = 1.0 # Placeholder
-                    atr_pct = 0.0 # Placeholder
-                    market_trend = "unknown" # Placeholder
-
                     self.adaptive_learner.log_trade_features(
                         trade_id=self.active_trade_id,
                         ticker=self.ticker,
                         regime=self.current_regime,
                         candidate_id=self.current_candidate_id,
+                        strategy_type=self.current_strategy_type, # NEW
                         orb_width_pct=orb_width_pct,
-                        gap_pct=gap_pct,
-                        rel_volume=rel_volume,
-                        atr_pct=atr_pct,
-                        market_trend=market_trend,
+                        gap_pct=gap_pct_val,
+                        rel_volume=rel_volume_val,
+                        atr_pct=atr_pct_val,
+                        market_trend=market_trend_val,
+                        rsi_value=rsi_val,
+                        short_sma=short_sma_val,
+                        long_sma=long_sma_val,
                     )
 
                 self.position_taken = False
-                self.active_trade_id = None # NEW: Clear internal trade ID
-                self.active_trade_order_id = None # Clear active trade
+                self.active_trade_id = None 
+                self.active_trade_order_id = None 
                 self.active_trade_entry_price = 0.0
                 self.active_trade_sl_price = 0.0
                 self.active_trade_tp_price = 0.0
                 self.active_trade_qty = 0
                 self.current_regime = "unknown"
                 self.current_candidate_id = "default"
+                self.current_strategy_type = "ORB"
                 return
 
-        # If range established and no position taken, check for breakout
-        if self.range_established and not self.position_taken:
-            if bar.close > self.orb_high:
-                logger.info(f"BREAKOUT {self.ticker} @ ${bar.close:.2f}")
-                
-                # NEW: Classify regime and select adaptive config
-                # Placeholder values for regime classification - replace with real data
-                atr_pct = 0.0 # Calculate actual ATR % from recent bars
-                gap_pct = 0.0 # Calculate actual gap % from previous close
-                market_above_ma = True # Determine if market is above key moving average
-                rel_volume = 1.0 # Calculate actual relative volume
+        # If no position taken, check for new trade opportunities based on selected strategy
+        if not self.position_taken:
+            # Classify regime and select adaptive config
+            self.current_regime = self.adaptive_learner.classify_regime(
+                ticker=self.ticker, current_price=bar.close, orb_width_pct=(self.orb_high - self.orb_low) / self.orb_low * 100 if self.orb_low > 0 else 0,
+                gap_pct=gap_pct_val, atr_pct=atr_pct_val, rel_volume=rel_volume_val,
+                rsi_value=rsi_val, short_sma=short_sma_val, long_sma=long_sma_val, market_trend=market_trend_val
+            )
+            
+            adaptive_config_dict, candidate_id, strategy_type, stats = self.adaptive_learner.select_candidate(
+                ticker=self.ticker,
+                regime=self.current_regime,
+                default_config=self.base_config # Pass the base config to be merged
+            )
+            self.current_candidate_id = candidate_id
+            self.current_strategy_type = strategy_type
+            logger.info(f"ADAPTIVE | {self.ticker} | Regime: {self.current_regime} | Strategy: {self.current_strategy_type} | Config: {self.current_candidate_id}")
 
-                self.current_regime = self.adaptive_learner.classify_regime(
-                    atr_pct=atr_pct, gap_pct=gap_pct, market_above_ma=market_above_ma, rel_volume=rel_volume
-                )
-                # Create a temporary config dict to pass to select_candidate
-                temp_config_for_adaptive = {
-                    "risk_per_trade_usd": self.config.get("risk_per_trade_usd", 50.0),
-                    "stop_loss_cents": self.config.get("stop_loss_cents", 10),
-                    "position_size_multiplier": self.config.get("position_size_multiplier", 1.0),
-                    "risk_reward_ratio": self.config.get("risk_reward_ratio", 2.0),
-                    "account_capital": self.config.get("account_capital", 0.0)
-                }
-                adaptive_config, candidate_id, stats = self.adaptive_learner.select_candidate(
-                    ticker=self.ticker,
-                    regime=self.current_regime,
-                    default_config=temp_config_for_adaptive
-                )
-                self.current_candidate_id = candidate_id
-                logger.info(f"ADAPTIVE | {self.ticker} | Regime: {self.current_regime} | Config: {self.current_candidate_id} | SL: {adaptive_config.get("stop_loss_cents")}c | RR: {adaptive_config.get("risk_reward_ratio")}:1")
-
-                order_details = await asyncio.to_thread(
-                    self.trader.execute_orb_setup, self.ticker, bar.close, adaptive_config # Use adaptive_config
-                )
-                if order_details:
-                    self.position_taken = True
-                    # NEW: Fetch the internal trade ID from the logger after entry
-                    # This assumes log_entry returns the ID or you can query it
-                    # For now, we'll use a placeholder or query the last inserted ID
-                    # A more robust solution would be to have log_entry return the ID
-                    self.active_trade_id = self.trader.logger_obj._get_connection().execute("SELECT id FROM trades ORDER BY id DESC LIMIT 1").fetchone()["id"]
-                    self.active_trade_order_id = order_details["order_id"]
-                    self.active_trade_entry_price = order_details["entry_price"]
-                    self.active_trade_sl_price = order_details["stop_loss_price"]
-                    self.active_trade_tp_price = order_details["take_profit_price"]
-                    self.active_trade_qty = order_details["quantity"]
-                else:
-                    logger.warning(f"Order submission failed for {self.ticker}")
+            # --- Entry Logic for different strategies ---
+            order_details = None
+            if self.current_strategy_type == "ORB":
+                if self.range_established and bar.close > self.orb_high:
+                    logger.info(f"ORB BREAKOUT {self.ticker} @ ${bar.close:.2f}")
+                    order_details = await asyncio.to_thread(
+                        self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
+                    )
+            elif self.current_strategy_type == "SMA_CROSS":
+                if short_sma_val and long_sma_val and short_sma_val > long_sma_val and self.bars[-2].close * (1 - adaptive_config_dict["short_sma_period"]/1000) <= self.bars[-2].close * (1 - adaptive_config_dict["long_sma_period"]/1000): # Simple cross check
+                    logger.info(f"SMA CROSSOVER {self.ticker} @ ${bar.close:.2f}")
+                    order_details = await asyncio.to_thread(
+                        self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
+                    )
+            elif self.current_strategy_type == "RSI_MR":
+                if rsi_val is not None and rsi_val < adaptive_config_dict.get("oversold_level", 30):
+                    logger.info(f"RSI OVERSOLD {self.ticker} @ ${bar.close:.2f} (RSI: {rsi_val})")
+                    order_details = await asyncio.to_thread(
+                        self.trader.execute_trade_setup, self.ticker, bar.close, adaptive_config_dict
+                    )
+            
+            if order_details:
+                self.position_taken = True
+                self.active_trade_id = self.trader.logger_obj._get_connection().execute("SELECT id FROM trades ORDER BY id DESC LIMIT 1").fetchone()["id"]
+                self.active_trade_order_id = order_details["order_id"]
+                self.active_trade_entry_price = order_details["entry_price"]
+                self.active_trade_sl_price = order_details["stop_loss_price"]
+                self.active_trade_tp_price = order_details["take_profit_price"]
+                self.active_trade_qty = order_details["quantity"]
+            else:
+                # Only log warning if a strategy was selected but no order was placed due to internal logic
+                if self.current_strategy_type != "ORB" or (self.range_established and bar.close > self.orb_high):
+                    logger.warning(f"Order submission failed for {self.ticker} with strategy {self.current_strategy_type}")
 
 # =============================================================================
 # ROBUST WEBSOCKET MANAGER
@@ -448,7 +552,7 @@ class RobustWebSocketManager:
         self.max_retries = max_retries
         self.retry_count = 0
         self.stream: Optional[StockDataStream] = None
-        self.subscriptions: Dict[str, List] = {} # Store subscriptions to re-apply
+        self.subscriptions: Dict[str, List[Tuple[callable, str]]] = {} # Store (handler, symbol) tuples
 
     async def connect_with_retry(self) -> StockDataStream:
         for attempt in range(self.max_retries):
@@ -465,12 +569,11 @@ class RobustWebSocketManager:
 
     def subscribe_bars(self, handler, *symbols):
         if self.stream:
-            self.stream.subscribe_bars(handler, *symbols)
             for symbol in symbols:
+                self.stream.subscribe_bars(handler, symbol)
                 if 'bars' not in self.subscriptions:
                     self.subscriptions['bars'] = []
-                # Store handler and symbols together for re-subscription
-                # This assumes one handler for all bars, which is true in your main.
+                # Store handler and symbol as a tuple for re-subscription
                 if (handler, symbol) not in self.subscriptions['bars']:
                     self.subscriptions['bars'].append((handler, symbol))
         else:
@@ -485,7 +588,6 @@ class RobustWebSocketManager:
                     for sub_type, items in self.subscriptions.items():
                         if sub_type == 'bars':
                             if items:
-                                # Re-subscribe each (handler, symbol) pair
                                 for handler, symbol in items:
                                     self.stream.subscribe_bars(handler, symbol)
                                     logger.info(f"Re-subscribed to bars for {symbol} with handler {handler.__name__}")
@@ -515,7 +617,7 @@ class UpGainPulseEngine:
         validator = AccountValidator(alpaca_client)
         self.trader = AlpacaPaperTrader(API_KEY, SECRET_KEY, self.logger_obj, validator)
         self.adaptive_learner = AdaptiveLearner() # NEW: Initialize AdaptiveLearner
-        self.state_machines = {ticker: ORBStateMachine(ticker, self.trader, config, self.adaptive_learner) for ticker in tickers} # NEW: Pass adaptive_learner
+        self.state_machines = {ticker: TradingStateMachine(ticker, self.trader, config, self.adaptive_learner) for ticker in tickers} # NEW: Pass adaptive_learner and use TradingStateMachine
         self.ws_manager = RobustWebSocketManager(API_KEY, SECRET_KEY)
 
     async def run(self):
@@ -543,7 +645,8 @@ class UpGainPulseEngine:
 
 async def main():
     TICKERS = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
-    config = {"account_capital": 500.0, "risk_per_trade_usd": 50.0, "stop_loss_cents": 10, "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0}
+    config = {"account_capital": 500.0, "risk_per_trade_usd": 50.0, 
+              "stop_loss_pct": 0.002, "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0}
     engine = UpGainPulseEngine(tickers=TICKERS, config=config)
     await engine.run()
 

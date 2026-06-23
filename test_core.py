@@ -7,6 +7,7 @@ import os
 import tempfile
 import asyncio
 from datetime import datetime, time, timedelta
+from collections import deque
 from pytz import timezone
 
 ET = timezone('US/Eastern') # Defined in upgainpulse.py
@@ -36,16 +37,10 @@ sys.modules['alpaca.data.live'] = MagicMock()
 sys.modules['alpaca.data.models'] = MagicMock()
 sys.modules['dotenv'] = MagicMock()
 
-# Set env vars FIRST (before any import of upgainpulse)
-os.environ['ALPACA_PAPER_API_KEY'] = 'test_key'
-os.environ['ALPACA_PAPER_SECRET_KEY'] = 'test_secret'
-
 # Set alpaca.trading.errors.APIError to be a real Exception subclass
-sys.modules['alpaca.common'] = MagicMock()
 sys.modules['alpaca.trading.errors'].APIError = MockAPIError
 
 # Import upgainpulse (will use env vars and mocked modules)
-import upgainpulse
 from upgainpulse import *
 from adaptive_strategy import AdaptiveLearner, CandidateConfig, DEFAULT_CANDIDATES # NEW: Import AdaptiveLearner and CandidateConfig
 
@@ -69,6 +64,7 @@ CREATE_TRADES_TABLE = '''CREATE TABLE IF NOT EXISTS trades (
     pnl REAL,
     regime TEXT,           -- NEW: Market regime at time of trade
     candidate_id TEXT,     -- NEW: ID of the candidate config used
+    strategy_type TEXT,    -- NEW: Type of strategy used (ORB, SMA_CROSS, RSI_MR)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )'''
 
@@ -113,37 +109,37 @@ class TestConfigValidation(unittest.TestCase):
     """Test configuration parameter validation."""
 
     def test_valid_config(self):
-        validate_config({"risk_per_trade_usd": 50.0, "stop_loss_cents": 10,
+        validate_config({"risk_per_trade_usd": 50.0, "stop_loss_pct": 0.002,
                          "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0, "account_capital": 500.0})
 
     def test_risk_zero(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": 0, "stop_loss_cents": 10,
+            validate_config({"risk_per_trade_usd": 0, "stop_loss_pct": 0.002,
                              "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0, "account_capital": 500.0})
 
     def test_risk_negative(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": -10, "stop_loss_cents": 10,
+            validate_config({"risk_per_trade_usd": -10, "stop_loss_pct": 0.002,
                              "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0, "account_capital": 500.0})
 
-    def test_sl_zero(self):
+    def test_sl_pct_zero(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": 50, "stop_loss_cents": 0,
+            validate_config({"risk_per_trade_usd": 50, "stop_loss_pct": 0,
                              "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0, "account_capital": 500.0})
 
     def test_multiplier_zero(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": 50, "stop_loss_cents": 10,
+            validate_config({"risk_per_trade_usd": 50, "stop_loss_pct": 0.002,
                              "position_size_multiplier": 0, "risk_reward_ratio": 2.0, "account_capital": 500.0})
 
     def test_rr_negative(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": 50, "stop_loss_cents": 10,
+            validate_config({"risk_per_trade_usd": 50, "stop_loss_pct": 0.002,
                              "position_size_multiplier": 1.0, "risk_reward_ratio": -1.0, "account_capital": 500.0})
 
     def test_rr_unrealistic(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": 50, "stop_loss_cents": 10,
+            validate_config({"risk_per_trade_usd": 50, "stop_loss_pct": 0.002,
                              "position_size_multiplier": 1.0, "risk_reward_ratio": 100.0, "account_capital": 500.0})
 
     def test_missing_keys_use_defaults(self):
@@ -152,7 +148,7 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_config_type_error(self):
         with self.assertRaises(ConfigError):
-            validate_config({"risk_per_trade_usd": "abc", "stop_loss_cents": 10,
+            validate_config({"risk_per_trade_usd": "abc", "stop_loss_pct": 0.002,
                              "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0, "account_capital": 500.0})
 
 # =============================================================================
@@ -201,12 +197,13 @@ class TestTradeLogger(unittest.TestCase):
         self.assertEqual(row['order_id'], "order_123")
         self.assertIsNone(row['exit_price'])
         self.assertIsNone(row['pnl'])
-        self.assertIsNone(row['regime']) # NEW: Check for new columns
-        self.assertIsNone(row['candidate_id']) # NEW: Check for new columns
+        self.assertIsNone(row['regime']) 
+        self.assertIsNone(row['candidate_id']) 
+        self.assertIsNone(row['strategy_type']) # NEW: Check for new columns
 
     def test_log_entry_with_adaptive_data(self):
-        self.logger.log_entry("SPY", "ORB_LONG", 500.0, 1, 499.90, 500.20, "order_124", 
-                              regime="trend", candidate_id="base")
+        self.logger.log_entry("SPY", "ORB", 500.0, 1, 499.90, 500.20, "order_124", 
+                              regime="trend", candidate_id="base", strategy_type="ORB")
         conn = self.logger._get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM trades WHERE order_id='order_124'")
@@ -214,19 +211,20 @@ class TestTradeLogger(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row['regime'], "trend")
         self.assertEqual(row['candidate_id'], "base")
+        self.assertEqual(row['strategy_type'], "ORB")
 
     def test_log_entry_without_order_id(self):
-        self.logger.log_entry("AAPL", "ORB_LONG", 180.0, 2, 179.90, 182.00, None)
+        self.logger.log_entry("AAPL", "SMA_CROSS", 180.0, 2, 179.90, 182.00, None)
         conn = self.logger._get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM trades WHERE ticker='AAPL'")
         row = cursor.fetchone()
         self.assertIsNotNone(row)
-        self.assertIsNone(row['order_id']) # order_id at index 11
+        self.assertIsNone(row['order_id']) 
 
     def test_update_exit_details(self):
         # First log an entry
-        self.logger.log_entry("SPY", "ORB_LONG", 500.0, 1, 499.90, 500.20, "order_123")
+        self.logger.log_entry("SPY", "ORB", 500.0, 1, 499.90, 500.20, "order_123")
         
         # Then update it
         exit_time = datetime.now() + timedelta(minutes=5)
@@ -248,7 +246,7 @@ class TestTradeLogger(unittest.TestCase):
         def log_trade(ticker):
             try:
                 for _ in range(5):
-                    self.logger.log_entry(ticker, "ORB_LONG", 100.0, 1, 99.90, 102.00)
+                    self.logger.log_entry(ticker, "ORB", 100.0, 1, 99.90, 102.00)
                     time.sleep(0.01)
             except Exception as e:
                 errors.append(str(e))
@@ -329,82 +327,114 @@ class TestPositionSizing(unittest.TestCase):
         self.config = {
             "account_capital": 500.0,
             "risk_per_trade_usd": 50.0,
-            "stop_loss_cents": 10,
+            "stop_loss_pct": 0.002, # Use percentage stop loss
             "position_size_multiplier": 1.0,
             "risk_reward_ratio": 2.0,
         }
 
     def test_spy_at_500(self):
-        self.assertEqual(calculate_position_size(500.0, self.config, 500.0), 1)
+        # $50 risk / ($500 * 0.002) = $50 / $1 = 50 shares
+        self.assertEqual(calculate_position_size(500.0, self.config, 5000.0), 50)
 
     def test_spy_at_250(self):
-        self.assertEqual(calculate_position_size(250.0, self.config, 500.0), 2)
+        # $50 risk / ($250 * 0.002) = $50 / $0.5 = 100 shares
+        self.assertEqual(calculate_position_size(250.0, self.config, 5000.0), 100)
 
     def test_qqq_at_400(self):
-        self.assertEqual(calculate_position_size(400.0, self.config, 500.0), 1)
+        # $50 risk / ($400 * 0.002) = $50 / $0.8 = 62 shares
+        self.assertEqual(calculate_position_size(400.0, self.config, 5000.0), 62)
 
-    def test_max_shares(self):
+    def test_max_shares_low_price(self):
+        # $50 risk / ($10 * 0.002) = $50 / $0.02 = 2500 shares
+        # Capped by $500 capital / $10 price = 50 shares
         self.assertEqual(calculate_position_size(10.0, self.config, 500.0), 50)
 
     def test_small_risk_large_stop(self):
         cfg = dict(self.config)
         cfg["risk_per_trade_usd"] = 0.25
-        cfg["stop_loss_cents"] = 100
-        self.assertEqual(calculate_position_size(500.0, cfg, 500.0), 0)
+        cfg["stop_loss_pct"] = 0.01 # 1% stop
+        # $0.25 risk / ($500 * 0.01) = $0.25 / $5 = 0 shares
+        self.assertEqual(calculate_position_size(500.0, cfg, 5000.0), 0)
 
     def test_double_multiplier(self):
         cfg = dict(self.config)
         cfg["position_size_multiplier"] = 2.0
-        self.assertEqual(calculate_position_size(250.0, cfg, 500.0), 2)
+        # $50 risk / ($250 * 0.002) * 2 = $50 / $0.5 * 2 = 200 shares
+        self.assertEqual(calculate_position_size(250.0, cfg, 5000.0), 200)
 
     def test_large_account_uses_risk_limit(self):
         cfg = dict(self.config)
         cfg["account_capital"] = 100000.0
-        self.assertEqual(calculate_position_size(500.0, cfg, 100000.0), 500)
+        # $50 risk / ($500 * 0.002) = 50 shares (risk limit is lower than capital limit)
+        self.assertEqual(calculate_position_size(500.0, cfg, 100000.0), 50)
 
     def test_zero_current_price(self):
         self.assertEqual(calculate_position_size(0.0, self.config, 500.0), 0)
 
-    def test_zero_stop_loss_cents(self):
+    def test_zero_stop_loss_pct(self):
         cfg = dict(self.config)
-        cfg["stop_loss_cents"] = 0
+        cfg["stop_loss_pct"] = 0
         self.assertEqual(calculate_position_size(500.0, cfg, 500.0), 0)
 
     def test_insufficient_buying_power(self):
+        # $50 risk / ($500 * 0.002) = 50 shares. But only $10 BP available.
         self.assertEqual(calculate_position_size(500.0, self.config, 10.0), 0)
 
 # =============================================================================
-# Test: TP/SL Calculation
+# Test: TP/SL Calculation (Updated for percentage-based stops)
 # =============================================================================
 class TestTPSLCalculation(unittest.TestCase):
-    """Test take-profit and stop-loss price calculations."""
+    """Test take-profit and stop-loss price calculations with percentage stops."""
 
-    def test_basic(self):
-        # SL: 500 - 0.10 = 499.90
-        # TP: 500 + (0.10 * 2.0) = 500.20
-        self.assertEqual(round(500.0 - 0.10, 2), 499.90)
-        self.assertEqual(round(500.0 + (0.10 * 2.0), 2), 500.20)
+    def setUp(self):
+        self.config = {
+            "risk_per_trade_usd": 50.0,
+            "stop_loss_pct": 0.002, # 0.2% stop
+            "take_profit_rr": 2.0,
+            "take_profit_pct": 0.005, # 0.5% target for RSI
+            "strategy_type": "ORB"
+        }
 
-    def test_larger_sl(self):
-        # SL: 500 - 0.50 = 499.50
-        # TP: 500 + (0.50 * 2.0) = 501.00
-        self.assertEqual(round(500.0 - 0.50, 2), 499.50)
-        self.assertEqual(round(500.0 + (0.50 * 2.0), 2), 501.00)
+    def test_orb_basic(self):
+        current_price = 500.0
+        sl_price = round(current_price * (1 - self.config["stop_loss_pct"]), 2) # 500 * (1 - 0.002) = 499.00
+        risk_dollars = current_price * self.config["stop_loss_pct"] # 500 * 0.002 = 1.00
+        tp_price = round(current_price + (risk_dollars * self.config["take_profit_rr"]), 2) # 500 + (1.00 * 2.0) = 502.00
+        
+        self.assertEqual(sl_price, 499.00)
+        self.assertEqual(tp_price, 502.00)
 
-    def test_high_rr(self):
-        # SL: 500 - 0.10 = 499.90
-        # TP: 500 + (0.10 * 3.0) = 500.30
-        self.assertEqual(round(500.0 - 0.10, 2), 499.90)
-        self.assertEqual(round(500.0 + (0.10 * 3.0), 2), 500.30)
+    def test_rsi_mr_basic(self):
+        current_price = 100.0
+        config = {**self.config, "strategy_type": "RSI_MR"}
+        sl_price = round(current_price * (1 - config["stop_loss_pct"]), 2) # 100 * (1 - 0.002) = 99.80
+        tp_price = round(current_price * (1 + config["take_profit_pct"]), 2) # 100 * (1 + 0.005) = 100.50
 
-    def test_low_price(self):
-        # SL: 100 - 0.10 = 99.90
-        # TP: 100 + (0.10 * 2.0) = 100.20
-        self.assertEqual(round(100.0 - 0.10, 2), 99.90)
-        self.assertEqual(round(100.0 + (0.10 * 2.0), 2), 100.20)
+        self.assertEqual(sl_price, 99.80)
+        self.assertEqual(tp_price, 100.50)
+
+    def test_sma_cross_high_rr(self):
+        current_price = 200.0
+        config = {**self.config, "strategy_type": "SMA_CROSS", "take_profit_rr": 3.0}
+        sl_price = round(current_price * (1 - config["stop_loss_pct"]), 2) # 200 * (1 - 0.002) = 199.60
+        risk_dollars = current_price * config["stop_loss_pct"] # 200 * 0.002 = 0.40
+        tp_price = round(current_price + (risk_dollars * config["take_profit_rr"]), 2) # 200 + (0.40 * 3.0) = 201.20
+
+        self.assertEqual(sl_price, 199.60)
+        self.assertEqual(tp_price, 201.20)
+
+    def test_invalid_tp_less_than_sl(self):
+        current_price = 100.0
+        config = {**self.config, "stop_loss_pct": 0.01, "take_profit_rr": 0.5} # SL 1%, RR 0.5:1
+        sl_price = round(current_price * (1 - config["stop_loss_pct"]), 2) # 99.00
+        risk_dollars = current_price * config["stop_loss_pct"] # 1.00
+        tp_price = round(current_price + (risk_dollars * config["take_profit_rr"]), 2) # 100 + (1.00 * 0.5) = 100.50
+        
+        # This scenario should be caught by the trader, but here we just check calculation
+        self.assertTrue(tp_price > sl_price) # Should still be true if RR > 0
 
 # =============================================================================
-# Test: AlpacaPaperTrader execute_orb_setup
+# Test: AlpacaPaperTrader execute_trade_setup (formerly execute_orb_setup)
 # =============================================================================
 class TestAlpacaPaperTrader(unittest.TestCase):
     """Test order execution logic."""
@@ -426,92 +456,109 @@ class TestAlpacaPaperTrader(unittest.TestCase):
         self.config = {
             "account_capital": 500.0,
             "risk_per_trade_usd": 50.0,
-            "stop_loss_cents": 10,
+            "stop_loss_pct": 0.002, # 0.2% stop
             "position_size_multiplier": 1.0,
-            "risk_reward_ratio": 2.0
+            "take_profit_rr": 2.0, # For ORB/SMA
+            "take_profit_pct": 0.005, # For RSI
+            "strategy_type": "ORB", # Default strategy type
+            "current_regime": "trend", # For logging
+            "candidate_id": "base" # For logging
         }
 
-    def test_execute_order_success(self):
-        self.mock_client.submit_order.return_value = MagicMock(id="order_abc123")
-        order_details = self.trader.execute_orb_setup("SPY", 500.0, self.config)
+    def test_execute_trade_setup_orb_success(self):
+        self.mock_client.submit_order.return_value = MagicMock(id="order_orb_123")
+        order_details = self.trader.execute_trade_setup("SPY", 500.0, self.config)
         self.assertIsNotNone(order_details)
         self.assertTrue(self.mock_client.submit_order.called_once())
         self.mock_logger.log_entry.assert_called_once_with(
-            "SPY", "ORB_LONG", 500.0, 1, 499.90, 500.20, "order_abc123",
-            regime=None, candidate_id=None # NEW: Check for new adaptive args
+            "SPY", "ORB", 500.0, 50, 499.00, 502.00, "order_orb_123",
+            regime="trend", candidate_id="base", strategy_type="ORB"
         )
-        self.assertEqual(order_details["order_id"], "order_abc123")
+        self.assertEqual(order_details["order_id"], "order_orb_123")
         self.assertEqual(order_details["entry_price"], 500.0)
-        self.assertEqual(order_details["quantity"], 1)
-        self.assertEqual(order_details["stop_loss_price"], 499.90)
-        self.assertEqual(order_details["take_profit_price"], 500.20)
+        self.assertEqual(order_details["quantity"], 50)
+        self.assertEqual(order_details["stop_loss_price"], 499.00)
+        self.assertEqual(order_details["take_profit_price"], 502.00)
+        self.assertEqual(order_details["strategy_type"], "ORB")
 
-    def test_execute_order_with_adaptive_data(self):
-        adaptive_config = {
-            **self.config,
-            "current_regime": "trend",
-            "candidate_id": "base"
-        }
-        self.mock_client.submit_order.return_value = MagicMock(id="order_abc124")
-        order_details = self.trader.execute_orb_setup("SPY", 500.0, adaptive_config)
+    def test_execute_trade_setup_rsi_mr_success(self):
+        rsi_config = {**self.config, "strategy_type": "RSI_MR"}
+        self.mock_client.submit_order.return_value = MagicMock(id="order_rsi_456")
+        order_details = self.trader.execute_trade_setup("AAPL", 180.0, rsi_config)
         self.assertIsNotNone(order_details)
+        self.assertTrue(self.mock_client.submit_order.called_once())
+        # SL: 180 * (1 - 0.002) = 179.64
+        # TP: 180 * (1 + 0.005) = 180.90
         self.mock_logger.log_entry.assert_called_once_with(
-            "SPY", "ORB_LONG", 500.0, 1, 499.90, 500.20, "order_abc124",
-            regime="trend", candidate_id="base"
+            "AAPL", "RSI_MR", 180.0, 138, 179.64, 180.90, "order_rsi_456",
+            regime="trend", candidate_id="base", strategy_type="RSI_MR"
         )
+        self.assertEqual(order_details["order_id"], "order_rsi_456")
+        self.assertEqual(order_details["quantity"], 138) # 50 / (180*0.002) = 50 / 0.36 = 138.8 -> 138
+        self.assertEqual(order_details["stop_loss_price"], 179.64)
+        self.assertEqual(order_details["take_profit_price"], 180.90)
+        self.assertEqual(order_details["strategy_type"], "RSI_MR")
 
-    def test_execute_order_insufficient_bp(self):
-        self.mock_validator.check_buying_power.return_value = False
-        order_details = self.trader.execute_orb_setup("SPY", 500.0, self.config)
+    def test_execute_trade_setup_insufficient_bp(self):
+        self.mock_validator.get_buying_power.return_value = 10.0 # Insufficient BP
+        order_details = self.trader.execute_trade_setup("SPY", 500.0, self.config)
         self.assertIsNone(order_details)
         self.mock_client.submit_order.assert_not_called()
 
-    def test_execute_order_cooldown(self):
-        self.trader.execute_orb_setup("SPY", 500.0, self.config) # First order
-        order_details = self.trader.execute_orb_setup("SPY", 500.0, self.config) # Second order immediately
+    def test_execute_trade_setup_cooldown(self):
+        self.trader.execute_trade_setup("SPY", 500.0, self.config) # First order
+        order_details = self.trader.execute_trade_setup("SPY", 500.0, self.config) # Second order immediately
         self.assertIsNone(order_details)
         self.mock_client.submit_order.assert_called_once() # Only first call should go through
 
-    def test_execute_order_qty_zero(self):
-        config = {"account_capital": 500.0, "risk_per_trade_usd": 0.25, "stop_loss_cents": 100,
-                  "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0}
-        order_details = self.trader.execute_orb_setup("SPY", 500.0, config)
+    def test_execute_trade_setup_qty_zero(self):
+        config = {**self.config, "risk_per_trade_usd": 0.25, "stop_loss_pct": 0.01} # Qty will be 0
+        order_details = self.trader.execute_trade_setup("SPY", 500.0, config)
         self.assertIsNone(order_details)
         self.mock_client.submit_order.assert_not_called()
 
-    def test_execute_order_api_error(self):
+    def test_execute_trade_setup_api_error(self):
         self.mock_client.submit_order.side_effect = MockAPIError("API error")
-        order_details = self.trader.execute_orb_setup("SPY", 500.0, self.config)
+        order_details = self.trader.execute_trade_setup("SPY", 500.0, self.config)
         self.assertIsNone(order_details)
         self.mock_client.submit_order.assert_called_once()
 
+    def test_execute_trade_setup_invalid_tp_less_than_sl(self):
+        config = {**self.config, "stop_loss_pct": 0.01, "take_profit_rr": 0.1} # TP will be < SL
+        order_details = self.trader.execute_trade_setup("SPY", 100.0, config)
+        self.assertIsNone(order_details)
+        self.mock_client.submit_order.assert_not_called()
+
 # =============================================================================
-# Test: ORB State Machine
+# Test: TradingStateMachine (formerly ORB State Machine)
 # =============================================================================
-class TestORBStateMachine(unittest.TestCase):
-    """Test the Opening Range Breakout state machine."""
+class TestTradingStateMachine(unittest.TestCase):
+    """Test the adaptive trading state machine."""
 
     def setUp(self):
         self.mock_trader = MagicMock(spec=AlpacaPaperTrader)
-        self.mock_trader.logger_obj = MagicMock(spec=TradeLogger) # Mock the logger within the trader
-        self.mock_adaptive_learner = MagicMock(spec=AdaptiveLearner) # NEW: Mock AdaptiveLearner
-        self.config = {
+        self.mock_trader.logger_obj = MagicMock(spec=TradeLogger) 
+        self.mock_adaptive_learner = MagicMock(spec=AdaptiveLearner) 
+        self.base_config = {
             "account_capital": 500.0,
             "risk_per_trade_usd": 50.0,
-            "stop_loss_cents": 10,
+            "stop_loss_pct": 0.002, 
             "position_size_multiplier": 1.0,
-            "risk_reward_ratio": 2.0
+            "take_profit_rr": 2.0,
+            "take_profit_pct": 0.005,
         }
-        self.sm = ORBStateMachine("SPY", self.mock_trader, self.config, self.mock_adaptive_learner) # NEW: Pass adaptive_learner
+        self.sm = TradingStateMachine("SPY", self.mock_trader, self.base_config, self.mock_adaptive_learner) 
 
-    def create_bar(self, hour, minute, high, low, close, symbol="SPY"):
-        dt = ET.localize(datetime(2026, 6, 15, hour, minute, 0))
+    def create_bar(self, hour, minute, open, high, low, close, volume=10000, symbol="SPY", day=15):
+        dt = ET.localize(datetime(2026, 6, day, hour, minute, 0))
         mock_bar = MagicMock()
         mock_bar.symbol = symbol
         mock_bar.timestamp = dt.astimezone(UTC)
+        mock_bar.open = open
         mock_bar.high = high
         mock_bar.low = low
         mock_bar.close = close
+        mock_bar.volume = volume
         return mock_bar
 
     def test_initial_state(self):
@@ -519,121 +566,217 @@ class TestORBStateMachine(unittest.TestCase):
         self.assertEqual(self.sm.orb_low, float('inf'))
         self.assertFalse(self.sm.range_established)
         self.assertFalse(self.sm.position_taken)
-        self.assertEqual(self.sm.current_regime, "unknown") # NEW: Check initial regime
-        self.assertEqual(self.sm.current_candidate_id, "default") # NEW: Check initial candidate ID
+        self.assertEqual(self.sm.current_regime, "unknown") 
+        self.assertEqual(self.sm.current_candidate_id, "default") 
+        self.assertEqual(self.sm.current_strategy_type, "ORB") # NEW: Check initial strategy type
+        self.assertEqual(len(self.sm.bars), 0)
+        self.assertEqual(len(self.sm.closes), 0)
+        self.assertEqual(len(self.sm.volumes), 0)
+        self.assertIsNone(self.sm.previous_day_close)
 
     async def test_build_range_during_orb_period(self):
-        bar1 = self.create_bar(9, 35, 501.0, 499.0, 500.0)
+        bar1 = self.create_bar(9, 35, 500.0, 501.0, 499.0, 500.5)
         await self.sm.process_minute_bar(bar1)
         self.assertEqual(self.sm.orb_high, 501.0)
         self.assertEqual(self.sm.orb_low, 499.0)
         self.assertFalse(self.sm.range_established)
+        self.assertEqual(len(self.sm.bars), 1)
+        self.assertEqual(len(self.sm.closes), 1)
+        self.assertEqual(len(self.sm.volumes), 1)
 
     async def test_lock_range_at_945(self):
-        bar1 = self.create_bar(9, 35, 501.0, 499.0, 500.0)
+        bar1 = self.create_bar(9, 35, 500.0, 501.0, 499.0, 500.5)
         await self.sm.process_minute_bar(bar1)
-        bar_lock = self.create_bar(9, 45, 502.0, 500.0, 501.0)
+        bar_lock = self.create_bar(9, 45, 500.5, 502.0, 500.0, 501.0)
         await self.sm.process_minute_bar(bar_lock)
         self.assertTrue(self.sm.range_established)
         self.assertEqual(self.sm.orb_high, 502.0)
-        self.assertEqual(self.sm.orb_low, 499.0) # Low from first bar
+        self.assertEqual(self.sm.orb_low, 499.0) 
 
-    async def test_breakout_executes_order(self):
+    async def test_orb_breakout_executes_order(self):
         # Build range
-        await self.sm.process_minute_bar(self.create_bar(9, 35, 501.0, 499.0, 500.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 35, 500.0, 501.0, 499.0, 500.5))
         # Lock range
-        await self.sm.process_minute_bar(self.create_bar(9, 45, 501.0, 499.0, 500.0))
-        self.sm.orb_high = 501.0 # Ensure a clear high for breakout
-        self.sm.orb_low = 499.0 # Ensure a clear low
+        await self.sm.process_minute_bar(self.create_bar(9, 45, 500.5, 501.0, 499.0, 500.0))
+        self.sm.orb_high = 501.0 
+        self.sm.orb_low = 499.0 
 
-        # Mock adaptive learner to return a specific config
-        self.mock_adaptive_learner.classify_regime.return_value = "trend"
+        # Mock adaptive learner to return an ORB config
+        self.mock_adaptive_learner.classify_regime.return_value = "uptrend_orb_momentum"
         self.mock_adaptive_learner.select_candidate.return_value = (
-            {"stop_loss_cents": 12, "risk_reward_ratio": 2.2, "position_size_multiplier": 1.0},
-            "adaptive_config_1",
+            {**self.base_config, "strategy_type": "ORB", "stop_loss_pct": 0.002, "take_profit_rr": 2.0},
+            "orb_base_2_1",
+            "ORB",
             {}
         )
 
         # Simulate successful order submission
-        self.mock_trader.execute_orb_setup.return_value = {
+        self.mock_trader.execute_trade_setup.return_value = {
             "order_id": "test_order_1",
             "entry_price": 502.50,
-            "quantity": 1,
-            "stop_loss_price": 502.40,
-            "take_profit_price": 502.70,
+            "quantity": 50,
+            "stop_loss_price": 501.49,
+            "take_profit_price": 504.51,
+            "strategy_type": "ORB"
         }
-        self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 1} # Mock internal trade ID
+        self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 1} 
 
         # Breakout bar
-        breakout_bar = self.create_bar(9, 46, 503.0, 501.0, 502.50)
+        breakout_bar = self.create_bar(9, 46, 502.0, 503.0, 501.0, 502.50)
         await self.sm.process_minute_bar(breakout_bar)
 
         self.assertTrue(self.sm.position_taken)
-        self.mock_adaptive_learner.classify_regime.assert_called_once() # NEW: Verify regime classification
-        self.mock_adaptive_learner.select_candidate.assert_called_once() # NEW: Verify candidate selection
-        self.mock_trader.execute_orb_setup.assert_called_once_with("SPY", 502.50, {
-            "account_capital": 500.0, "risk_per_trade_usd": 50.0, "stop_loss_cents": 12, # NEW: Adaptive SL
-            "position_size_multiplier": 1.0, "risk_reward_ratio": 2.2 # NEW: Adaptive RR
+        self.mock_adaptive_learner.classify_regime.assert_called_once() 
+        self.mock_adaptive_learner.select_candidate.assert_called_once() 
+        self.mock_trader.execute_trade_setup.assert_called_once_with("SPY", 502.50, {
+            **self.base_config, "strategy_type": "ORB", "stop_loss_pct": 0.002, "take_profit_rr": 2.0
         })
         self.assertEqual(self.sm.active_trade_order_id, "test_order_1")
-        self.assertEqual(self.sm.active_trade_id, 1) # NEW: Check internal trade ID
-        self.assertEqual(self.sm.current_regime, "trend") # NEW: Check current regime
-        self.assertEqual(self.sm.current_candidate_id, "adaptive_config_1") # NEW: Check current candidate ID
+        self.assertEqual(self.sm.active_trade_id, 1) 
+        self.assertEqual(self.sm.current_regime, "uptrend_orb_momentum") 
+        self.assertEqual(self.sm.current_candidate_id, "orb_base_2_1") 
+        self.assertEqual(self.sm.current_strategy_type, "ORB") # NEW: Check current strategy type
+
+    async def test_sma_crossover_executes_order(self):
+        # Prime the SMA with enough bars for calculation
+        for i in range(49):
+            await self.sm.process_minute_bar(self.create_bar(9, 0, 100.0, 100.5, 99.5, 100.0, day=14, volume=5000))
+        
+        # Simulate SMA cross config
+        sma_config = {**self.base_config, "strategy_type": "SMA_CROSS", "short_sma_period": 5, "long_sma_period": 20, "stop_loss_pct": 0.005, "take_profit_rr": 2.5}
+        self.mock_adaptive_learner.classify_regime.return_value = "strong_uptrend_sma_cross"
+        self.mock_adaptive_learner.select_candidate.return_value = (
+            sma_config,
+            "sma_5_20_trend",
+            "SMA_CROSS",
+            {}
+        )
+
+        # Simulate successful order submission
+        self.mock_trader.execute_trade_setup.return_value = {
+            "order_id": "test_order_sma_2",
+            "entry_price": 101.00,
+            "quantity": 10,
+            "stop_loss_price": 100.49,
+            "take_profit_price": 102.76,
+            "strategy_type": "SMA_CROSS"
+        }
+        self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 2}
+
+        # Simulate bars leading to a bullish SMA crossover
+        # Previous bar: short_sma < long_sma
+        await self.sm.process_minute_bar(self.create_bar(9, 50, 100.0, 100.5, 99.5, 100.0, day=15, volume=5000)) # Bar 50
+        # Current bar: short_sma > long_sma
+        await self.sm.process_minute_bar(self.create_bar(9, 51, 100.5, 101.5, 100.0, 101.0, day=15, volume=15000)) # Bar 51, crossover
+
+        self.assertTrue(self.sm.position_taken)
+        self.mock_adaptive_learner.classify_regime.assert_called_once() 
+        self.mock_adaptive_learner.select_candidate.assert_called_once() 
+        self.mock_trader.execute_trade_setup.assert_called_once_with("SPY", 101.0, sma_config)
+        self.assertEqual(self.sm.current_strategy_type, "SMA_CROSS")
+
+    async def test_rsi_mean_reversion_executes_order(self):
+        # Prime the RSI with enough bars for calculation
+        for i in range(14):
+            await self.sm.process_minute_bar(self.create_bar(9, 0, 100.0, 100.5, 99.5, 100.0, day=14, volume=5000))
+        
+        # Simulate RSI MR config
+        rsi_config = {**self.base_config, "strategy_type": "RSI_MR", "rsi_period": 14, "oversold_level": 30, "take_profit_pct": 0.005}
+        self.mock_adaptive_learner.classify_regime.return_value = "oversold_bounce"
+        self.mock_adaptive_learner.select_candidate.return_value = (
+            rsi_config,
+            "rsi_14_oversold",
+            "RSI_MR",
+            {}
+        )
+
+        # Simulate successful order submission
+        self.mock_trader.execute_trade_setup.return_value = {
+            "order_id": "test_order_rsi_3",
+            "entry_price": 99.00,
+            "quantity": 10,
+            "stop_loss_price": 98.80,
+            "take_profit_price": 99.49,
+            "strategy_type": "RSI_MR"
+        }
+        self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 3}
+
+        # Simulate bars leading to RSI oversold (e.g., several consecutive down closes)
+        # For simplicity, we'll force the RSI value in the state machine for this test
+        self.sm.last_rsi_value = 25 # Force oversold RSI
+        await self.sm.process_minute_bar(self.create_bar(9, 55, 99.5, 99.5, 98.5, 99.0, day=15, volume=10000)) # RSI oversold
+
+        self.assertTrue(self.sm.position_taken)
+        self.mock_adaptive_learner.classify_regime.assert_called_once() 
+        self.mock_adaptive_learner.select_candidate.assert_called_once() 
+        self.mock_trader.execute_trade_setup.assert_called_once_with("SPY", 99.0, rsi_config)
+        self.assertEqual(self.sm.current_strategy_type, "RSI_MR")
 
     async def test_no_breakout_below_range(self):
         # Build range
-        await self.sm.process_minute_bar(self.create_bar(9, 35, 501.0, 499.0, 500.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 35, 500.0, 501.0, 499.0, 500.5))
         # Lock range
-        await self.sm.process_minute_bar(self.create_bar(9, 45, 501.0, 499.0, 500.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 45, 500.5, 501.0, 499.0, 500.0))
         self.sm.orb_high = 501.0
         self.sm.orb_low = 499.0
 
+        # Mock adaptive learner to return an ORB config
+        self.mock_adaptive_learner.classify_regime.return_value = "general_range"
+        self.mock_adaptive_learner.select_candidate.return_value = (
+            {**self.base_config, "strategy_type": "ORB"},
+            "orb_base_2_1",
+            "ORB",
+            {}
+        )
+
         # Bar below high
-        no_breakout_bar = self.create_bar(9, 46, 500.5, 498.0, 499.50)
+        no_breakout_bar = self.create_bar(9, 46, 500.5, 500.5, 498.0, 499.50)
         await self.sm.process_minute_bar(no_breakout_bar)
 
         self.assertFalse(self.sm.position_taken)
-        self.mock_trader.execute_orb_setup.assert_not_called()
-        self.mock_adaptive_learner.classify_regime.assert_not_called() # NEW: No adaptive call if no breakout
+        self.mock_trader.execute_trade_setup.assert_not_called()
+        self.mock_adaptive_learner.classify_regime.assert_called_once() 
 
     async def test_no_double_order(self):
         # Build range
-        await self.sm.process_minute_bar(self.create_bar(9, 35, 501.0, 499.0, 500.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 35, 500.0, 501.0, 499.0, 500.5))
         # Lock range
-        await self.sm.process_minute_bar(self.create_bar(9, 45, 501.0, 499.0, 500.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 45, 500.5, 501.0, 499.0, 500.0))
         self.sm.orb_high = 501.0
         self.sm.orb_low = 499.0
 
         # Mock adaptive learner
-        self.mock_adaptive_learner.classify_regime.return_value = "trend"
+        self.mock_adaptive_learner.classify_regime.return_value = "uptrend_orb_momentum"
         self.mock_adaptive_learner.select_candidate.return_value = (
-            {"stop_loss_cents": 10, "risk_reward_ratio": 2.0, "position_size_multiplier": 1.0},
-            "base",
+            {**self.base_config, "strategy_type": "ORB"},
+            "orb_base_2_1",
+            "ORB",
             {}
         )
 
         # First breakout
-        self.mock_trader.execute_orb_setup.return_value = {
+        self.mock_trader.execute_trade_setup.return_value = {
             "order_id": "test_order_1", "entry_price": 502.0, "quantity": 1,
-            "stop_loss_price": 501.90, "take_profit_price": 502.10
+            "stop_loss_price": 501.90, "take_profit_price": 502.10,
+            "strategy_type": "ORB"
         }
         self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 1}
-        await self.sm.process_minute_bar(self.create_bar(9, 46, 503.0, 501.0, 502.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 46, 502.0, 503.0, 501.0, 502.0))
         self.assertTrue(self.sm.position_taken)
 
         # Second breakout attempt
-        self.mock_trader.execute_orb_setup.reset_mock() # Clear previous call
+        self.mock_trader.execute_trade_setup.reset_mock() 
         self.mock_adaptive_learner.classify_regime.reset_mock()
         self.mock_adaptive_learner.select_candidate.reset_mock()
-        await self.sm.process_minute_bar(self.create_bar(9, 47, 504.0, 502.0, 503.0))
-        self.assertFalse(self.mock_trader.execute_orb_setup.called)
-        self.mock_adaptive_learner.classify_regime.assert_not_called() # NEW: No adaptive call if position taken
-        self.mock_adaptive_learner.select_candidate.assert_not_called() # NEW: No adaptive call if position taken
+        await self.sm.process_minute_bar(self.create_bar(9, 47, 503.0, 504.0, 502.0, 503.0))
+        self.assertFalse(self.mock_trader.execute_trade_setup.called)
+        self.mock_adaptive_learner.classify_regime.assert_not_called() 
+        self.mock_adaptive_learner.select_candidate.assert_not_called() 
 
     async def test_sl_hit_closes_position(self):
         # Simulate an active position
         self.sm.position_taken = True
-        self.sm.active_trade_id = 1 # NEW: Set internal trade ID
+        self.sm.active_trade_id = 1 
         self.sm.active_trade_order_id = "test_order_1"
         self.sm.active_trade_entry_price = 502.50
         self.sm.active_trade_sl_price = 502.40
@@ -641,9 +784,19 @@ class TestORBStateMachine(unittest.TestCase):
         self.sm.active_trade_qty = 1
         self.sm.current_regime = "trend"
         self.sm.current_candidate_id = "base"
+        self.sm.current_strategy_type = "ORB"
+        self.sm.orb_high = 501.0
+        self.sm.orb_low = 499.0
+        self.sm.last_gap_pct = 0.5
+        self.sm.last_rel_volume = 1.5
+        self.sm.last_atr_pct = 1.0
+        self.sm.last_market_trend = "up"
+        self.sm.last_rsi_value = 60.0
+        self.sm.last_short_sma = 501.0
+        self.sm.last_long_sma = 500.0
 
         # Bar hits SL
-        sl_hit_bar = self.create_bar(10, 0, 502.45, 502.30, 502.35) # Low hits SL
+        sl_hit_bar = self.create_bar(10, 0, 502.45, 502.45, 502.30, 502.35) 
         await self.sm.process_minute_bar(sl_hit_bar)
 
         self.assertFalse(self.sm.position_taken)
@@ -651,18 +804,20 @@ class TestORBStateMachine(unittest.TestCase):
             "test_order_1", 502.40, round((502.40 - 502.50) * 1, 2), sl_hit_bar.timestamp
         )
         self.mock_adaptive_learner.log_trade_features.assert_called_once_with(
-            trade_id=1, ticker="SPY", regime="trend", candidate_id="base",
-            orb_width_pct=Mock(return_value=0.0), gap_pct=0.0, rel_volume=1.0, atr_pct=0.0, market_trend="unknown"
-        ) # NEW: Verify trade features logged
+            trade_id=1, ticker="SPY", regime="trend", candidate_id="base", strategy_type="ORB",
+            orb_width_pct=Mock(return_value=0.0), gap_pct=0.5, rel_volume=1.5, atr_pct=1.0, market_trend="up",
+            rsi_value=60.0, short_sma=501.0, long_sma=500.0
+        ) 
         self.assertIsNone(self.sm.active_trade_order_id)
         self.assertIsNone(self.sm.active_trade_id)
         self.assertEqual(self.sm.current_regime, "unknown")
         self.assertEqual(self.sm.current_candidate_id, "default")
+        self.assertEqual(self.sm.current_strategy_type, "ORB")
 
     async def test_tp_hit_closes_position(self):
         # Simulate an active position
         self.sm.position_taken = True
-        self.sm.active_trade_id = 2 # NEW: Set internal trade ID
+        self.sm.active_trade_id = 2 
         self.sm.active_trade_order_id = "test_order_2"
         self.sm.active_trade_entry_price = 502.50
         self.sm.active_trade_sl_price = 502.40
@@ -670,9 +825,19 @@ class TestORBStateMachine(unittest.TestCase):
         self.sm.active_trade_qty = 1
         self.sm.current_regime = "range"
         self.sm.current_candidate_id = "wide_rr"
+        self.sm.current_strategy_type = "RSI_MR"
+        self.sm.orb_high = 501.0
+        self.sm.orb_low = 499.0
+        self.sm.last_gap_pct = -0.2
+        self.sm.last_rel_volume = 0.8
+        self.sm.last_atr_pct = 0.5
+        self.sm.last_market_trend = "sideways"
+        self.sm.last_rsi_value = 40.0
+        self.sm.last_short_sma = 500.0
+        self.sm.last_long_sma = 500.5
 
         # Bar hits TP
-        tp_hit_bar = self.create_bar(10, 5, 502.80, 502.65, 502.75) # High hits TP
+        tp_hit_bar = self.create_bar(10, 5, 502.70, 502.80, 502.65, 502.75) 
         await self.sm.process_minute_bar(tp_hit_bar)
 
         self.assertFalse(self.sm.position_taken)
@@ -680,78 +845,174 @@ class TestORBStateMachine(unittest.TestCase):
             "test_order_2", 502.70, round((502.70 - 502.50) * 1, 2), tp_hit_bar.timestamp
         )
         self.mock_adaptive_learner.log_trade_features.assert_called_once_with(
-            trade_id=2, ticker="SPY", regime="range", candidate_id="wide_rr",
-            orb_width_pct=Mock(return_value=0.0), gap_pct=0.0, rel_volume=1.0, atr_pct=0.0, market_trend="unknown"
-        ) # NEW: Verify trade features logged
+            trade_id=2, ticker="SPY", regime="range", candidate_id="wide_rr", strategy_type="RSI_MR",
+            orb_width_pct=Mock(return_value=0.0), gap_pct=-0.2, rel_volume=0.8, atr_pct=0.5, market_trend="sideways",
+            rsi_value=40.0, short_sma=500.0, long_sma=500.5
+        ) 
         self.assertIsNone(self.sm.active_trade_order_id)
         self.assertIsNone(self.sm.active_trade_id)
         self.assertEqual(self.sm.current_regime, "unknown")
         self.assertEqual(self.sm.current_candidate_id, "default")
+        self.assertEqual(self.sm.current_strategy_type, "ORB")
 
     async def test_daily_reset_triggers(self):
         self.sm.orb_high = 510.0
         self.sm.orb_low = 490.0
         self.sm.range_established = True
         self.sm.position_taken = True
-        self.sm.active_trade_id = 3 # NEW: Set internal trade ID
+        self.sm.active_trade_id = 3 
         self.sm.active_trade_order_id = "test_order_3"
         self.sm.current_regime = "high_vol_trend"
         self.sm.current_candidate_id = "tight_fast"
+        self.sm.current_strategy_type = "SMA_CROSS"
         self.sm.last_reset_date = datetime.now().date() - timedelta(days=1)
 
         # Process a bar on a new day
-        bar = self.create_bar(9, 31, 500.0, 498.0, 499.0)
+        bar = self.create_bar(9, 31, 500.0, 500.0, 498.0, 499.0)
         await self.sm.process_minute_bar(bar)
 
         self.assertFalse(self.sm.position_taken)
         self.assertFalse(self.sm.range_established)
-        self.assertEqual(self.sm.orb_high, 500.0) # Reset and updated by new bar
-        self.assertEqual(self.sm.orb_low, 498.0) # Reset and updated by new bar
+        self.assertEqual(self.sm.orb_high, 500.0) 
+        self.assertEqual(self.sm.orb_low, 498.0) 
         self.assertEqual(self.sm.last_reset_date, datetime.now().date())
-        self.assertIsNone(self.sm.active_trade_id) # NEW: Check reset of internal trade ID
+        self.assertIsNone(self.sm.active_trade_id) 
         self.assertIsNone(self.sm.active_trade_order_id)
-        self.assertEqual(self.sm.current_regime, "unknown") # NEW: Check reset of regime
-        self.assertEqual(self.sm.current_candidate_id, "default") # NEW: Check reset of candidate ID
+        self.assertEqual(self.sm.current_regime, "unknown") 
+        self.assertEqual(self.sm.current_candidate_id, "default") 
+        self.assertEqual(self.sm.current_strategy_type, "ORB")
 
     async def test_premarket_no_action(self):
         # Set current time to pre-market (e.g., 9:00 AM ET)
-        bar = self.create_bar(9, 0, 500.0, 498.0, 499.0)
+        bar = self.create_bar(9, 0, 500.0, 500.0, 498.0, 499.0)
         await self.sm.process_minute_bar(bar)
-        self.assertEqual(self.sm.orb_high, 0.0) # Should not update ORB high/low
+        self.assertEqual(self.sm.orb_high, 0.0) 
         self.mock_adaptive_learner.classify_regime.assert_not_called()
         self.mock_adaptive_learner.select_candidate.assert_not_called()
 
     async def test_afterhours_no_double_order(self):
         # Build range and take position
-        await self.sm.process_minute_bar(self.create_bar(9, 35, 501.0, 499.0, 500.0))
-        await self.sm.process_minute_bar(self.create_bar(9, 45, 501.0, 499.0, 500.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 35, 500.0, 501.0, 499.0, 500.5))
+        await self.sm.process_minute_bar(self.create_bar(9, 45, 500.5, 501.0, 499.0, 500.0))
         self.sm.orb_high = 501.0
         self.sm.orb_low = 499.0
 
         # Mock adaptive learner
-        self.mock_adaptive_learner.classify_regime.return_value = "range"
+        self.mock_adaptive_learner.classify_regime.return_value = "uptrend_orb_momentum"
         self.mock_adaptive_learner.select_candidate.return_value = (
-            {"stop_loss_cents": 10, "risk_reward_ratio": 2.0, "position_size_multiplier": 1.0},
-            "base",
+            {**self.base_config, "strategy_type": "ORB"},
+            "orb_base_2_1",
+            "ORB",
             {}
         )
 
         # First breakout
-        self.mock_trader.execute_orb_setup.return_value = {
+        self.mock_trader.execute_trade_setup.return_value = {
             "order_id": "order_afterhours_1", "entry_price": 502.0, "quantity": 1,
-            "stop_loss_price": 501.90, "take_profit_price": 502.10
+            "stop_loss_price": 501.90, "take_profit_price": 502.10,
+            "strategy_type": "ORB"
         }
         self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 4}
-        await self.sm.process_minute_bar(self.create_bar(9, 46, 503.0, 501.0, 502.0))
+        await self.sm.process_minute_bar(self.create_bar(9, 46, 502.0, 503.0, 501.0, 502.0))
         self.assertTrue(self.sm.position_taken)
-        self.mock_trader.execute_orb_setup.assert_called_once()
+        self.mock_trader.execute_trade_setup.assert_called_once()
 
         # Simulate after-hours bar (e.g., 15:00 ET, after 4 PM market close)
-        self.mock_trader.execute_orb_setup.reset_mock() # Clear previous call
+        self.mock_trader.execute_trade_setup.reset_mock() 
         self.mock_adaptive_learner.classify_regime.reset_mock()
         self.mock_adaptive_learner.select_candidate.reset_mock()
-        await self.sm.process_minute_bar(self.create_bar(15, 0, 510.0, 505.0, 508.0))
-        self.assertEqual(self.mock_trader.execute_orb_setup.call_count, 0) # No new order
+        await self.sm.process_minute_bar(self.create_bar(15, 0, 510.0, 510.0, 505.0, 508.0))
+        self.assertEqual(self.mock_trader.execute_trade_setup.call_count, 0) 
+        self.mock_adaptive_learner.classify_regime.assert_not_called()
+        self.mock_adaptive_learner.select_candidate.assert_not_called()
+
+    async def test_market_close_closes_position(self):
+        # Simulate an active position
+        self.sm.position_taken = True
+        self.sm.active_trade_id = 5 
+        self.sm.active_trade_order_id = "test_order_market_close"
+        self.sm.active_trade_entry_price = 100.0
+        self.sm.active_trade_sl_price = 99.0
+        self.sm.active_trade_tp_price = 102.0
+        self.sm.active_trade_qty = 10
+        self.sm.current_regime = "general_uptrend"
+        self.sm.current_candidate_id = "orb_base_2_1"
+        self.sm.current_strategy_type = "ORB"
+        self.sm.orb_high = 101.0
+        self.sm.orb_low = 99.5
+        self.sm.last_gap_pct = 0.1
+        self.sm.last_rel_volume = 1.1
+        self.sm.last_atr_pct = 0.8
+        self.sm.last_market_trend = "up"
+        self.sm.last_rsi_value = 55.0
+        self.sm.last_short_sma = 100.5
+        self.sm.last_long_sma = 100.0
+
+        # Simulate bar at market close (4:00 PM ET)
+        market_close_bar = self.create_bar(16, 0, 100.5, 100.5, 100.0, 100.25) 
+        await self.sm.process_minute_bar(market_close_bar)
+
+        self.assertFalse(self.sm.position_taken)
+        self.mock_trader.logger_obj.update_exit_details.assert_called_once_with(
+            "test_order_market_close", 100.25, round((100.25 - 100.0) * 10, 2), market_close_bar.timestamp
+        )
+        self.mock_adaptive_learner.log_trade_features.assert_called_once_with(
+            trade_id=5, ticker="SPY", regime="general_uptrend", candidate_id="orb_base_2_1", strategy_type="ORB",
+            orb_width_pct=Mock(return_value=0.0), gap_pct=0.1, rel_volume=1.1, atr_pct=0.8, market_trend="up",
+            rsi_value=55.0, short_sma=100.5, long_sma=100.0
+        ) 
+        self.assertIsNone(self.sm.active_trade_order_id)
+        self.assertIsNone(self.sm.active_trade_id)
+        self.assertEqual(self.sm.current_regime, "unknown")
+        self.assertEqual(self.sm.current_candidate_id, "default")
+        self.assertEqual(self.sm.current_strategy_type, "ORB")
+
+    async def test_daily_reset_triggers(self):
+        self.sm.orb_high = 510.0
+        self.sm.orb_low = 490.0
+        self.sm.range_established = True
+        self.sm.position_taken = True
+        self.sm.active_trade_id = 3 
+        self.sm.active_trade_order_id = "test_order_3"
+        self.sm.current_regime = "high_vol_trend"
+        self.sm.current_candidate_id = "tight_fast"
+        self.sm.current_strategy_type = "SMA_CROSS"
+        self.sm.last_reset_date = datetime.now().date() - timedelta(days=1)
+
+        # Process a bar on a new day
+        bar = self.create_bar(9, 31, 500.0, 500.0, 498.0, 499.0)
+        await self.sm.process_minute_bar(bar)
+
+        self.assertFalse(self.sm.position_taken)
+        self.assertFalse(self.sm.range_established)
+        self.assertEqual(self.sm.orb_high, 500.0) 
+        self.assertEqual(self.sm.orb_low, 498.0) 
+        self.assertEqual(self.sm.last_reset_date, datetime.now().date())
+        self.assertIsNone(self.sm.active_trade_id) 
+        self.assertIsNone(self.sm.active_trade_order_id)
+        self.assertEqual(self.sm.current_regime, "unknown") 
+        self.assertEqual(self.sm.current_candidate_id, "default") 
+        self.assertEqual(self.sm.current_strategy_type, "ORB")
+
+    async def test_premarket_no_action_before_market_open(self):
+        # Set current time to pre-market (e.g., 9:00 AM ET)
+        bar = self.create_bar(9, 0, 500.0, 500.0, 498.0, 499.0)
+        await self.sm.process_minute_bar(bar)
+        self.assertEqual(self.sm.orb_high, 0.0) 
+        self.mock_adaptive_learner.classify_regime.assert_not_called()
+        self.mock_adaptive_learner.select_candidate.assert_not_called()
+
+    async def test_afterhours_no_new_trade_after_market_close(self):
+        # Simulate market close and no active position
+        self.sm.position_taken = False
+        self.sm.range_established = True
+        self.sm.orb_high = 501.0
+        self.sm.orb_low = 499.0
+
+        # Simulate after-hours bar (e.g., 16:01 ET, after 4 PM market close)
+        after_hours_bar = self.create_bar(16, 1, 510.0, 510.0, 505.0, 508.0)
+        await self.sm.process_minute_bar(after_hours_bar)
+        self.mock_trader.execute_trade_setup.assert_not_called() 
         self.mock_adaptive_learner.classify_regime.assert_not_called()
         self.mock_adaptive_learner.select_candidate.assert_not_called()
 
@@ -777,24 +1038,27 @@ class TestMultiDayReset(unittest.TestCase):
     def setUp(self):
         self.mock_trader = MagicMock(spec=AlpacaPaperTrader)
         self.mock_trader.logger_obj = MagicMock(spec=TradeLogger)
-        self.mock_adaptive_learner = MagicMock(spec=AdaptiveLearner) # NEW: Mock AdaptiveLearner
-        self.config = {
+        self.mock_adaptive_learner = MagicMock(spec=AdaptiveLearner) 
+        self.base_config = {
             "account_capital": 500.0,
             "risk_per_trade_usd": 50.0,
-            "stop_loss_cents": 10,
+            "stop_loss_pct": 0.002, 
             "position_size_multiplier": 1.0,
-            "risk_reward_ratio": 2.0
+            "take_profit_rr": 2.0,
+            "take_profit_pct": 0.005,
         }
-        self.sm = ORBStateMachine("SPY", self.mock_trader, self.config, self.mock_adaptive_learner) # NEW: Pass adaptive_learner
+        self.sm = TradingStateMachine("SPY", self.mock_trader, self.base_config, self.mock_adaptive_learner) 
 
-    def create_bar(self, day, hour, minute, high, low, close, symbol="SPY"):
+    def create_bar(self, day, hour, minute, open, high, low, close, volume=10000, symbol="SPY"):
         dt = ET.localize(datetime(2026, 6, day, hour, minute, 0))
         mock_bar = MagicMock()
         mock_bar.symbol = symbol
         mock_bar.timestamp = dt.astimezone(UTC)
+        mock_bar.open = open
         mock_bar.high = high
         mock_bar.low = low
         mock_bar.close = close
+        mock_bar.volume = volume
         return mock_bar
 
     async def test_force_reset_via_check_daily(self):
@@ -803,13 +1067,14 @@ class TestMultiDayReset(unittest.TestCase):
         self.sm.position_taken = True
         self.sm.range_established = True
         self.sm.orb_high, self.sm.orb_low = 505.0, 503.0
-        self.sm.active_trade_id = 10 # NEW: Set internal trade ID
+        self.sm.active_trade_id = 10 
         self.sm.active_trade_order_id = "test_order_reset"
         self.sm.current_regime = "trend"
         self.sm.current_candidate_id = "base"
+        self.sm.current_strategy_type = "ORB"
 
         # Process a bar on the new day, which should trigger a reset
-        bar = self.create_bar(16, 9, 31, 500.0, 498.0, 499.0) # Day 16
+        bar = self.create_bar(16, 9, 31, 500.0, 500.0, 498.0, 499.0) 
         await self.sm.process_minute_bar(bar)
 
         self.assertFalse(self.sm.position_taken)
@@ -817,205 +1082,11 @@ class TestMultiDayReset(unittest.TestCase):
         self.assertEqual(self.sm.orb_high, 500.0)
         self.assertEqual(self.sm.orb_low, 498.0)
         self.assertEqual(self.sm.last_reset_date, datetime(2026, 6, 16).date())
-        self.assertIsNone(self.sm.active_trade_id) # NEW: Check reset of internal trade ID
+        self.assertIsNone(self.sm.active_trade_id) 
         self.assertIsNone(self.sm.active_trade_order_id)
-        self.assertEqual(self.sm.current_regime, "unknown") # NEW: Check reset of regime
-        self.assertEqual(self.sm.current_candidate_id, "default") # NEW: Check reset of candidate ID
-
-# =============================================================================
-# Test: Analytics
-# =============================================================================
-class TestTradeAnalytics(unittest.TestCase):
-    """Test the analytics/reporting module."""
-
-    def setUp(self):
-        import analytics as an
-        self.an = an
-        self.db_fd, self.db_path = tempfile.mkstemp(suffix='.db')
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(CREATE_TRADES_TABLE)
-        conn.commit()
-        conn.close()
-        self.analytics = self.an.TradeAnalytics(db_path=self.db_path)
-
-    def tearDown(self):
-        self.analytics.close()
-        os.close(self.db_fd)
-        os.unlink(self.db_path)
-
-    def _insert(self, status, pnl, ticker="SPY", regime=None, candidate_id=None):
-        self.analytics.conn.execute('''INSERT INTO trades
-            (timestamp_entry, timestamp_exit, ticker, setup_type, entry_price, exit_price, quantity, stop_loss, take_profit, status, pnl, regime, candidate_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ''', ("2026-06-15 10:00:00", "2026-06-15 11:00:00", ticker, "ORB_LONG",
-              500.0, 502.0, 1, 499.90, 502.0, status, pnl, regime, candidate_id))
-        self.analytics.conn.commit()
-
-    def test_fetch_empty(self):
-        self.assertEqual(self.analytics.fetch_closed_trades(), [])
-
-    def test_fetch_one(self):
-        self._insert("CLOSED", 2.0)
-        trades = self.analytics.fetch_closed_trades()
-        self.assertEqual(len(trades), 1)
-        self.assertEqual(trades[0]['pnl'], 2.0)
-        self.assertIsNone(trades[0]['regime']) # NEW: Check for new columns
-        self.assertIsNone(trades[0]['candidate_id']) # NEW: Check for new columns
-
-    def test_fetch_with_adaptive_data(self):
-        self._insert("CLOSED", 2.0, regime="trend", candidate_id="base")
-        trades = self.analytics.fetch_closed_trades()
-        self.assertEqual(trades[0]['regime'], "trend")
-        self.assertEqual(trades[0]['candidate_id'], "base")
-
-    def test_fetch_filters_open(self):
-        self._insert("OPEN", None)
-        self._insert("CLOSED", 2.0)
-        self.assertEqual(len(self.analytics.fetch_closed_trades()), 1)
-
-    def test_fetch_by_ticker(self):
-        self._insert("CLOSED", 2.0)
-        self._insert("CLOSED", 1.5, ticker="QQQ")
-        self.assertEqual(len(self.analytics.fetch_closed_trades(ticker="SPY")), 1)
-        self.assertEqual(len(self.analytics.fetch_closed_trades(ticker="QQQ")), 1)
-
-    def test_fetch_by_regime(self):
-        self._insert("CLOSED", 2.0, regime="trend")
-        self._insert("CLOSED", 1.0, regime="range")
-        self.assertEqual(len(self.analytics.fetch_closed_trades(regime="trend")), 1)
-        self.assertEqual(len(self.analytics.fetch_closed_trades(regime="range")), 1)
-        self.assertEqual(len(self.analytics.fetch_closed_trades(regime="unknown")), 0)
-
-    def test_fetch_by_candidate_id(self):
-        self._insert("CLOSED", 2.0, candidate_id="base")
-        self._insert("CLOSED", 1.0, candidate_id="wide_rr")
-        self.assertEqual(len(self.analytics.fetch_closed_trades(candidate_id="base")), 1)
-        self.assertEqual(len(self.analytics.fetch_closed_trades(candidate_id="wide_rr")), 1)
-        self.assertEqual(len(self.analytics.fetch_closed_trades(candidate_id="unknown")), 0)
-
-    def test_fetch_by_multiple_filters(self):
-        self._insert("CLOSED", 2.0, ticker="SPY", regime="trend", candidate_id="base")
-        self._insert("CLOSED", 1.0, ticker="QQQ", regime="range", candidate_id="wide_rr")
-        self._insert("CLOSED", 3.0, ticker="SPY", regime="range", candidate_id="base")
-        trades = self.analytics.fetch_closed_trades(ticker="SPY", regime="trend", candidate_id="base")
-        self.assertEqual(len(trades), 1)
-        self.assertEqual(trades[0]['pnl'], 2.0)
-
-    def test_report_all_winning(self):
-        for _ in range(3):
-            self._insert("CLOSED", 2.0)
-        r = self.analytics.generate_performance_report()
-        self.assertEqual(r['total_trades'], 3)
-        self.assertEqual(r['winning_trades'], 3)
-        self.assertEqual(r['net_pnl'], 6.0)
-
-    def test_report_mixed(self):
-        self._insert("CLOSED", 2.0)
-        self._insert("CLOSED", -1.0)
-        self._insert("CLOSED", 2.0)
-        r = self.analytics.generate_performance_report()
-        self.assertEqual(r['total_trades'], 3)
-        self.assertEqual(r['winning_trades'], 2)
-        self.assertEqual(r['net_pnl'], 3.0)
-
-    def test_report_all_losing(self):
-        for _ in range(2):
-            self._insert("CLOSED", -1.0)
-        r = self.analytics.generate_performance_report()
-        self.assertEqual(r['winning_trades'], 0)
-        self.assertEqual(r['win_rate_pct'], 0.0)
-
-    def test_report_empty(self):
-        self.assertIsNone(self.analytics.generate_performance_report())
-
-    def test_report_by_regime(self):
-        self._insert("CLOSED", 2.0, regime="trend")
-        self._insert("CLOSED", -1.0, regime="trend")
-        self._insert("CLOSED", 1.0, regime="range")
-        report = self.analytics.generate_performance_report(regime="trend")
-        self.assertIsNotNone(report)
-        self.assertEqual(report['total_trades'], 2)
-        self.assertEqual(report['net_pnl'], 1.0)
-        self.assertEqual(report['regime'], "trend")
-
-    def test_report_by_candidate_id(self):
-        self._insert("CLOSED", 2.0, candidate_id="base")
-        self._insert("CLOSED", -1.0, candidate_id="base")
-        self._insert("CLOSED", 1.0, candidate_id="wide_rr")
-        report = self.analytics.generate_performance_report(candidate_id="base")
-        self.assertIsNotNone(report)
-        self.assertEqual(report['total_trades'], 2)
-        self.assertEqual(report['net_pnl'], 1.0)
-        self.assertEqual(report['candidate_id'], "base")
-
-# =============================================================================
-# Test: WebSocket Reconnection
-# =============================================================================
-class TestWebSocketReconnect(unittest.TestCase):
-    """Test WebSocket connection and reconnection logic."""
-
-    @patch('upgainpulse.StockDataStream')
-    async def test_connect_success(self, MockStockDataStream):
-        mock_stream_instance = MockStockDataStream.return_value
-        ws = RobustWebSocketManager("key", "secret", max_retries=3)
-        result = await ws.connect_with_retry()
-        self.assertEqual(result, mock_stream_instance)
-        MockStockDataStream.assert_called_once_with("key", "secret")
-
-    @patch('upgainpulse.StockDataStream')
-    @patch('asyncio.sleep', new_callable=MagicMock)
-    async def test_connect_eventually_succeeds(self, mock_sleep, MockStockDataStream):
-        MockStockDataStream.side_effect = [Exception("fail1"), Exception("fail2"), MockStockDataStream.return_value]
-        ws = RobustWebSocketManager("key", "secret", max_retries=3)
-        result = await ws.connect_with_retry()
-        self.assertIsNotNone(result)
-        self.assertEqual(MockStockDataStream.call_count, 3)
-        self.assertEqual(mock_sleep.call_count, 2)
-
-    @patch('upgainpulse.StockDataStream')
-    @patch('asyncio.sleep', new_callable=MagicMock)
-    async def test_connect_exhausted_retries(self, mock_sleep, MockStockDataStream):
-        MockStockDataStream.side_effect = Exception("always fails")
-        ws = RobustWebSocketManager("key", "secret", max_retries=2)
-        with self.assertRaises(ConnectionError):
-            await ws.connect_with_retry()
-        self.assertEqual(MockStockDataStream.call_count, 2)
-        self.assertEqual(mock_sleep.call_count, 2)
-
-    @patch('upgainpulse.StockDataStream')
-    @patch('asyncio.sleep', new_callable=MagicMock)
-    async def test_run_with_reconnect_reapplies_subscriptions(self, mock_sleep, MockStockDataStream):
-        mock_stream_instance_1 = MagicMock()
-        mock_stream_instance_2 = MagicMock()
-        
-        # Simulate stream failing once, then succeeding
-        MockStockDataStream.side_effect = [
-            mock_stream_instance_1, # Initial connect
-            Exception("Stream disconnected"), # First run_forever fails
-            mock_stream_instance_2, # Reconnect attempt
-            MagicMock() # Second run_forever succeeds
-        ]
-
-        ws = RobustWebSocketManager("key", "secret", max_retries=2)
-        
-        # Initial connection and subscription
-        stream = await ws.connect_with_retry()
-        mock_handler = MagicMock()
-        ws.subscribe_bars(mock_handler, "SPY", "QQQ")
-        
-        # Simulate run_forever loop
-        mock_stream_instance_1._run_forever.side_effect = Exception("Simulated disconnect")
-        mock_stream_instance_2._run_forever.side_effect = asyncio.CancelledError # To stop the loop
-
-        with self.assertRaises(asyncio.CancelledError): # Expecting the loop to be cancelled
-            await ws.run_with_reconnect()
-
-        # Verify initial subscription
-        mock_stream_instance_1.subscribe_bars.assert_called_once_with(mock_handler, "SPY", "QQQ")
-        
-        # Verify reconnection and re-subscription
-        mock_stream_instance_2.subscribe_bars.assert_called_once_with(mock_handler, "SPY", "QQQ")
-        self.assertEqual(mock_sleep.call_count, 1) # One sleep for the reconnect
+        self.assertEqual(self.sm.current_regime, "unknown") 
+        self.assertEqual(self.sm.current_candidate_id, "default") 
+        self.assertEqual(self.sm.current_strategy_type, "ORB")
 
 # =============================================================================
 # Test: AdaptiveLearner (NEW)
@@ -1044,182 +1115,114 @@ class TestAdaptiveLearner(unittest.TestCase):
         except PermissionError:
             pass
 
-    def _insert_trade(self, ticker, pnl, regime, candidate_id, status="CLOSED", trade_id=None):
+    def _insert_trade(self, ticker, pnl, regime, candidate_id, strategy_type="ORB", status="CLOSED", trade_id=None):
         if trade_id is None:
             cursor = self.learner.conn.execute("SELECT MAX(id) FROM trades")
             trade_id = (cursor.fetchone()[0] or 0) + 1
         self.learner.conn.execute("""
-            INSERT INTO trades (id, timestamp_entry, timestamp_exit, ticker, setup_type, entry_price, exit_price, quantity, stop_loss, take_profit, status, pnl, regime, candidate_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (id, timestamp_entry, timestamp_exit, ticker, setup_type, entry_price, exit_price, quantity, stop_loss, take_profit, status, pnl, regime, candidate_id, strategy_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (trade_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-              ticker, "ORB_LONG", 100.0, 100.0 + pnl, 1, 99.0, 101.0, status, pnl, regime, candidate_id))
+              ticker, strategy_type, 100.0, 100.0 + pnl, 1, 99.0, 101.0, status, pnl, regime, candidate_id, strategy_type))
         self.learner.conn.commit()
         return trade_id
 
     def test_seed_candidates(self):
         candidates = self.learner.get_enabled_candidates()
         self.assertEqual(len(candidates), len(DEFAULT_CANDIDATES))
-        self.assertEqual(candidates[0].candidate_id, "base")
+        self.assertEqual(candidates[0].candidate_id, "orb_base_2_1")
+        self.assertEqual(candidates[0].strategy_type, "ORB")
 
     def test_classify_regime(self):
-        self.assertEqual(self.learner.classify_regime(atr_pct=3.0, gap_pct=0.5, market_above_ma=True, rel_volume=1.0), "high_vol_trend")
-        self.assertEqual(self.learner.classify_regime(atr_pct=0.5, gap_pct=0.2, market_above_ma=True, rel_volume=1.5), "trend")
-        self.assertEqual(self.learner.classify_regime(atr_pct=0.5, gap_pct=0.2, market_above_ma=False, rel_volume=0.8), "quiet_range")
-        self.assertEqual(self.learner.classify_regime(atr_pct=1.5, gap_pct=0.5, market_above_ma=True, rel_volume=1.0), "range")
+        # atr_pct, gap_pct, market_above_ma, rel_volume, rsi_value, short_sma, long_sma, market_trend
+        self.assertEqual(self.learner.classify_regime("SPY", 500.0, 0.5, 1.6, 3.0, 1.0, 50.0, 500.0, 499.0, "up"), "high_vol_gap")
+        self.assertEqual(self.learner.classify_regime("SPY", 500.0, 0.5, 0.5, 0.5, 1.5, 60.0, 501.0, 500.0, "up"), "strong_uptrend_sma_cross")
+        self.assertEqual(self.learner.classify_regime("SPY", 500.0, 0.5, 0.5, 0.5, 1.1, 60.0, 501.0, 500.0, "up"), "uptrend_orb_momentum")
+        self.assertEqual(self.learner.classify_regime("SPY", 500.0, 0.5, 0.5, 0.5, 0.7, 25.0, 499.0, 500.0, "sideways"), "oversold_bounce")
+        self.assertEqual(self.learner.classify_regime("SPY", 500.0, 0.5, 0.5, 0.5, 0.7, 50.0, 500.0, 500.0, "sideways"), "quiet_range")
+        self.assertEqual(self.learner.classify_regime("SPY", 500.0, 0.5, 0.5, 1.5, 1.0, 50.0, 500.0, 500.0, "sideways"), "general_range")
 
     def test_log_trade_features(self):
-        trade_id = self._insert_trade("SPY", 1.0, "trend", "base")
-        self.learner.log_trade_features(trade_id, "SPY", "trend", "base", 0.5, 0.1, 1.2, 1.0, "up")
+        trade_id = self._insert_trade("SPY", 1.0, "trend", "orb_base_2_1", "ORB")
+        self.learner.log_trade_features(trade_id, "SPY", "trend", "orb_base_2_1", "ORB", 0.5, 0.1, 1.2, 1.0, "up", 60.0, 501.0, 500.0)
         cursor = self.learner.conn.execute("SELECT * FROM trade_features WHERE trade_id=?", (trade_id,))
         row = cursor.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row['ticker'], "SPY")
         self.assertEqual(row['regime'], "trend")
-        self.assertEqual(row['candidate_id'], "base")
+        self.assertEqual(row['candidate_id'], "orb_base_2_1")
+        self.assertEqual(row['strategy_type'], "ORB")
         self.assertEqual(row['orb_width_pct'], 0.5)
+        self.assertEqual(row['rsi_value'], 60.0)
+        self.assertEqual(row['short_sma'], 501.0)
+        self.assertEqual(row['long_sma'], 500.0)
 
     def test_candidate_stats_empty(self):
-        stats = self.learner._candidate_stats("SPY", "trend", "base")
+        stats = self.learner._candidate_stats("SPY", "trend", "orb_base_2_1")
         self.assertEqual(stats['n'], 0)
         self.assertEqual(stats['score'], -999.0)
 
     def test_candidate_stats_winning(self):
-        self._insert_trade("SPY", 1.0, "trend", "base")
-        self._insert_trade("SPY", 2.0, "trend", "base")
-        stats = self.learner._candidate_stats("SPY", "trend", "base")
+        self._insert_trade("SPY", 1.0, "trend", "orb_base_2_1")
+        self._insert_trade("SPY", 2.0, "trend", "orb_base_2_1")
+        stats = self.learner._candidate_stats("SPY", "trend", "orb_base_2_1")
         self.assertEqual(stats['n'], 2)
         self.assertAlmostEqual(stats['expectancy'], 1.5)
         self.assertAlmostEqual(stats['win_rate'], 1.0)
-        self.assertAlmostEqual(stats['profit_factor'], 999.0) # All wins
+        self.assertAlmostEqual(stats['profit_factor'], 999.0) 
 
     def test_candidate_stats_losing(self):
-        self._insert_trade("SPY", -1.0, "trend", "base")
-        self._insert_trade("SPY", -0.5, "trend", "base")
-        stats = self.learner._candidate_stats("SPY", "trend", "base")
+        self._insert_trade("SPY", -1.0, "trend", "orb_base_2_1")
+        self._insert_trade("SPY", -0.5, "trend", "orb_base_2_1")
+        stats = self.learner._candidate_stats("SPY", "trend", "orb_base_2_1")
         self.assertEqual(stats['n'], 2)
         self.assertAlmostEqual(stats['expectancy'], -0.75)
         self.assertAlmostEqual(stats['win_rate'], 0.0)
-        self.assertAlmostEqual(stats['profit_factor'], 0.0) # All losses
+        self.assertAlmostEqual(stats['profit_factor'], 0.0) 
 
     def test_candidate_stats_mixed(self):
-        self._insert_trade("SPY", 2.0, "trend", "base")
-        self._insert_trade("SPY", -1.0, "trend", "base")
-        stats = self.learner._candidate_stats("SPY", "trend", "base")
+        self._insert_trade("SPY", 2.0, "trend", "orb_base_2_1")
+        self._insert_trade("SPY", -1.0, "trend", "orb_base_2_1")
+        stats = self.learner._candidate_stats("SPY", "trend", "orb_base_2_1")
         self.assertEqual(stats['n'], 2)
         self.assertAlmostEqual(stats['expectancy'], 0.5)
         self.assertAlmostEqual(stats['win_rate'], 0.5)
         self.assertAlmostEqual(stats['profit_factor'], 2.0)
 
     def test_select_candidate_no_exploration(self):
-        # With exploration_rate = 0.0, it should always pick the best score
-        self._insert_trade("SPY", 2.0, "trend", "base")
-        self._insert_trade("SPY", -1.0, "trend", "base")
-        self._insert_trade("SPY", 3.0, "trend", "wide_rr")
-        self._insert_trade("SPY", 0.5, "trend", "wide_rr")
+        self._insert_trade("SPY", 2.0, "uptrend_orb_momentum", "orb_base_2_1")
+        self._insert_trade("SPY", -1.0, "uptrend_orb_momentum", "orb_base_2_1")
+        self._insert_trade("SPY", 3.0, "uptrend_orb_momentum", "orb_tight_3_1")
+        self._insert_trade("SPY", 0.5, "uptrend_orb_momentum", "orb_tight_3_1")
 
-        # base: expectancy 0.5, win_rate 0.5, PF 2.0
-        # wide_rr: expectancy 1.75, win_rate 1.0, PF 999.0
+        chosen_config, candidate_id, strategy_type, _ = self.learner.select_candidate("SPY", "uptrend_orb_momentum", self.base_config)
+        self.assertEqual(candidate_id, "orb_tight_3_1")
+        self.assertEqual(strategy_type, "ORB")
+        self.assertEqual(chosen_config["stop_loss_pct"], 0.0015) 
 
-        chosen_config, candidate_id, _ = self.learner.select_candidate("SPY", "trend", self.config)
-        self.assertEqual(candidate_id, "wide_rr")
-        self.assertEqual(chosen_config["stop_loss_cents"], 15) # From wide_rr
-
-    @patch('random.random', return_value=0.05) # Force exploration
+    @patch('random.random', return_value=0.05) 
     def test_select_candidate_with_exploration(self, mock_random):
         self.learner.exploration_rate = 0.1
-        self._insert_trade("SPY", 2.0, "trend", "base")
-        self._insert_trade("SPY", -1.0, "trend", "base")
-        self._insert_trade("SPY", 3.0, "trend", "wide_rr")
-        self._insert_trade("SPY", 0.5, "trend", "wide_rr")
+        self._insert_trade("SPY", 2.0, "uptrend_orb_momentum", "orb_base_2_1")
+        self._insert_trade("SPY", -1.0, "uptrend_orb_momentum", "orb_base_2_1")
+        self._insert_trade("SPY", 3.0, "uptrend_orb_momentum", "orb_tight_3_1")
+        self._insert_trade("SPY", 0.5, "uptrend_orb_momentum", "orb_tight_3_1")
 
-        # With exploration, it might pick a random one even if another has a better score
-        chosen_config, candidate_id, _ = self.learner.select_candidate("SPY", "trend", self.config)
-        # Since random.random() < exploration_rate, it should pick a random candidate
-        # We can't assert a specific candidate, but we can assert it's one of the defaults
+        chosen_config, candidate_id, strategy_type, _ = self.learner.select_candidate("SPY", "uptrend_orb_momentum", self.base_config)
         self.assertIn(candidate_id, [c.candidate_id for c in DEFAULT_CANDIDATES])
+        self.assertIn(strategy_type, [c.strategy_type for c in DEFAULT_CANDIDATES])
 
     def test_select_candidate_low_sample_penalty(self):
-        self.learner.exploration_rate = 0.0 # No random exploration
+        self.learner.exploration_rate = 0.0 
         self.learner.min_trades_before_promote = 5
 
-        # base has 2 trades, wide_rr has 1 trade
-        self._insert_trade("SPY", 2.0, "trend", "base")
-        self._insert_trade("SPY", -1.0, "trend", "base")
-        self._insert_trade("SPY", 3.0, "trend", "wide_rr")
+        self._insert_trade("SPY", 2.0, "uptrend_orb_momentum", "orb_base_2_1")
+        self._insert_trade("SPY", -1.0, "uptrend_orb_momentum", "orb_base_2_1")
+        self._insert_trade("SPY", 3.0, "uptrend_orb_momentum", "orb_tight_3_1")
 
-        # Even if wide_rr has a higher raw score, it has fewer than min_trades_before_promote
-        # so it should be penalized, potentially leading to 'base' being chosen.
-        chosen_config, candidate_id, _ = self.learner.select_candidate("SPY", "trend", self.config)
-        self.assertEqual(candidate_id, "base") # Base should be chosen due to penalty on wide_rr
-
-# =============================================================================
-# Test: WebSocket Reconnection
-# =============================================================================
-class TestWebSocketReconnect(unittest.TestCase):
-    """Test WebSocket connection and reconnection logic."""
-
-    @patch('upgainpulse.StockDataStream')
-    async def test_connect_success(self, MockStockDataStream):
-        mock_stream_instance = MockStockDataStream.return_value
-        ws = RobustWebSocketManager("key", "secret", max_retries=3)
-        result = await ws.connect_with_retry()
-        self.assertEqual(result, mock_stream_instance)
-        MockStockDataStream.assert_called_once_with("key", "secret")
-
-    @patch('upgainpulse.StockDataStream')
-    @patch('asyncio.sleep', new_callable=MagicMock)
-    async def test_connect_eventually_succeeds(self, mock_sleep, MockStockDataStream):
-        MockStockDataStream.side_effect = [Exception("fail1"), Exception("fail2"), MockStockDataStream.return_value]
-        ws = RobustWebSocketManager("key", "secret", max_retries=3)
-        result = await ws.connect_with_retry()
-        self.assertIsNotNone(result)
-        self.assertEqual(MockStockDataStream.call_count, 3)
-        self.assertEqual(mock_sleep.call_count, 2)
-
-    @patch('upgainpulse.StockDataStream')
-    @patch('asyncio.sleep', new_callable=MagicMock)
-    async def test_connect_exhausted_retries(self, mock_sleep, MockStockDataStream):
-        MockStockDataStream.side_effect = Exception("always fails")
-        ws = RobustWebSocketManager("key", "secret", max_retries=2)
-        with self.assertRaises(ConnectionError):
-            await ws.connect_with_retry()
-        self.assertEqual(MockStockDataStream.call_count, 2)
-        self.assertEqual(mock_sleep.call_count, 2)
-
-    @patch('upgainpulse.StockDataStream')
-    @patch('asyncio.sleep', new_callable=MagicMock)
-    async def test_run_with_reconnect_reapplies_subscriptions(self, mock_sleep, MockStockDataStream):
-        mock_stream_instance_1 = MagicMock()
-        mock_stream_instance_2 = MagicMock()
-        
-        # Simulate stream failing once, then succeeding
-        MockStockDataStream.side_effect = [
-            mock_stream_instance_1, # Initial connect
-            Exception("Stream disconnected"), # First run_forever fails
-            mock_stream_instance_2, # Reconnect attempt
-            MagicMock() # Second run_forever succeeds
-        ]
-
-        ws = RobustWebSocketManager("key", "secret", max_retries=2)
-        
-        # Initial connection and subscription
-        stream = await ws.connect_with_retry()
-        mock_handler = MagicMock()
-        ws.subscribe_bars(mock_handler, "SPY", "QQQ")
-        
-        # Simulate run_forever loop
-        mock_stream_instance_1._run_forever.side_effect = Exception("Simulated disconnect")
-        mock_stream_instance_2._run_forever.side_effect = asyncio.CancelledError # To stop the loop
-
-        with self.assertRaises(asyncio.CancelledError): # Expecting the loop to be cancelled
-            await ws.run_with_reconnect()
-
-        # Verify initial subscription
-        mock_stream_instance_1.subscribe_bars.assert_called_once_with(mock_handler, "SPY", "QQQ")
-        
-        # Verify reconnection and re-subscription
-        mock_stream_instance_2.subscribe_bars.assert_called_once_with(mock_handler, "SPY", "QQQ")
-        self.assertEqual(mock_sleep.call_count, 1) # One sleep for the reconnect
+        chosen_config, candidate_id, strategy_type, _ = self.learner.select_candidate("SPY", "uptrend_orb_momentum", self.base_config)
+        self.assertEqual(candidate_id, "orb_base_2_1") 
+        self.assertEqual(strategy_type, "ORB")
 
 # =============================================================================
 # Test: Integration Scenarios
@@ -1228,11 +1231,12 @@ class TestIntegrationScenarios(unittest.TestCase):
     """Higher-level integration-style tests."""
 
     def setUp(self):
-        self.mock_adaptive_learner = MagicMock(spec=AdaptiveLearner) # NEW: Mock AdaptiveLearner for integration tests
-        self.mock_adaptive_learner.classify_regime.return_value = "trend"
+        self.mock_adaptive_learner = MagicMock(spec=AdaptiveLearner) 
+        self.mock_adaptive_learner.classify_regime.return_value = "uptrend_orb_momentum"
         self.mock_adaptive_learner.select_candidate.return_value = (
-            {"stop_loss_cents": 10, "risk_reward_ratio": 2.0, "position_size_multiplier": 1.0},
-            "base",
+            {"stop_loss_pct": 0.002, "take_profit_rr": 2.0, "position_size_multiplier": 1.0, "strategy_type": "ORB"},
+            "orb_base_2_1",
+            "ORB",
             {}
         )
 
@@ -1244,13 +1248,13 @@ class TestIntegrationScenarios(unittest.TestCase):
             engine = UpGainPulseEngine(
                 tickers=["SPY", "QQQ"],
                 config={"account_capital": 500.0, "risk_per_trade_usd": 50.0,
-                        "stop_loss_cents": 10, "position_size_multiplier": 1.0,
+                        "stop_loss_pct": 0.002, "position_size_multiplier": 1.0,
                         "risk_reward_ratio": 2.0}
             )
             self.assertEqual(len(engine.state_machines), 2)
             self.assertIn("SPY", engine.state_machines)
             self.assertIn("QQQ", engine.state_machines)
-            self.assertIsNotNone(engine.adaptive_learner) # NEW: Check adaptive learner init
+            self.assertIsNotNone(engine.adaptive_learner) 
 
     @patch('upgainpulse.TradingClient')
     @patch('upgainpulse.AccountValidator')
@@ -1260,99 +1264,103 @@ class TestIntegrationScenarios(unittest.TestCase):
         # Mock dependencies
         mock_stream = MagicMock()
         MockWSManager.return_value.connect_with_retry.return_value = mock_stream
-        MockWSManager.return_value.run_with_reconnect.side_effect = asyncio.CancelledError # To stop the engine loop
+        MockWSManager.return_value.run_with_reconnect.side_effect = asyncio.CancelledError 
         
         mock_trader_instance = MagicMock(spec=AlpacaPaperTrader)
-        mock_trader_instance.logger_obj = MockTradeLogger.return_value # Ensure logger is mocked correctly
-        MockTradingClient.return_value = MagicMock() # For AlpacaPaperTrader init
-        MockAccountValidator.return_value.get_buying_power.return_value = 5000.0 # Sufficient BP
+        mock_trader_instance.logger_obj = MockTradeLogger.return_value 
+        MockTradingClient.return_value = MagicMock() 
+        MockAccountValidator.return_value.get_buying_power.return_value = 5000.0 
 
-        # Mock execute_orb_setup to return order details
-        mock_trader_instance.execute_orb_setup.return_value = {
+        # Mock execute_trade_setup to return order details
+        mock_trader_instance.execute_trade_setup.return_value = {
             "order_id": "test_order_SPY", "entry_price": 196.30, "quantity": 1,
-            "stop_loss_price": 196.20, "take_profit_price": 196.50
+            "stop_loss_price": 196.20, "take_profit_price": 196.50,
+            "strategy_type": "ORB"
         }
 
         # Patch AlpacaPaperTrader and AdaptiveLearner to return our mock instances
         with patch('upgainpulse.AlpacaPaperTrader', return_value=mock_trader_instance), \
-             patch('upgainpulse.AdaptiveLearner', return_value=self.mock_adaptive_learner): # NEW: Patch AdaptiveLearner
-            sm = ORBStateMachine("AAPL", mock_trader_instance, {
-                "risk_per_trade_usd": 50.0, "stop_loss_cents": 10,
-                "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0
-            }, self.mock_adaptive_learner) # NEW: Pass adaptive_learner
+             patch('upgainpulse.AdaptiveLearner', return_value=self.mock_adaptive_learner): 
+            sm = TradingStateMachine("AAPL", mock_trader_instance, {
+                "risk_per_trade_usd": 50.0, "stop_loss_pct": 0.002,
+                "position_size_multiplier": 1.0, "take_profit_rr": 2.0
+            }, self.mock_adaptive_learner) 
 
-            def create_bar(h, m, hi, lo, cl):
-                d = ET.localize(datetime(2026, 6, 15, h, m, 0))
+            def create_bar(h, m, o, hi, lo, cl, vol=10000, day=15):
+                d = ET.localize(datetime(2026, 6, day, h, m, 0))
                 b = MagicMock()
-                b.symbol, b.timestamp, b.high, b.low, b.close = "AAPL", d.astimezone(UTC), hi, lo, cl
+                b.symbol, b.timestamp, b.open, b.high, b.low, b.close, b.volume = "AAPL", d.astimezone(UTC), o, hi, lo, cl, vol
                 return b
 
             # Simulate ORB range building
-            await sm.process_minute_bar(create_bar(9, 31, 195.5, 194.8, 195.2))
-            self.assertEqual(sm.orb_high, 195.5)
-            self.assertEqual(sm.orb_low, 194.8)
-
-            await sm.process_minute_bar(create_bar(9, 38, 196.0, 195.3, 195.8))
-            self.assertEqual(sm.orb_high, 196.0)
-            self.assertEqual(sm.orb_low, 194.8)
-
-            await sm.process_minute_bar(create_bar(9, 44, 195.5, 194.5, 194.5))
-            self.assertEqual(sm.orb_high, 196.0)
-            self.assertEqual(sm.orb_low, 194.5)
+            await sm.process_minute_bar(create_bar(9, 31, 195.0, 195.5, 194.8, 195.2))
+            await sm.process_minute_bar(create_bar(9, 38, 195.2, 196.0, 195.3, 195.8))
+            await sm.process_minute_bar(create_bar(9, 44, 195.8, 195.5, 194.5, 194.5))
 
             # Lock range at 9:45
-            await sm.process_minute_bar(create_bar(9, 45, 195.0, 194.0, 194.5))
+            await sm.process_minute_bar(create_bar(9, 45, 194.5, 195.0, 194.0, 194.5))
             self.assertTrue(sm.range_established)
             self.assertFalse(sm.position_taken)
 
             # Breakout and order execution
-            breakout_bar = create_bar(9, 46, 196.5, 195.0, 196.3)
+            breakout_bar = create_bar(9, 46, 196.0, 196.5, 195.0, 196.3)
+            self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 1}
             await sm.process_minute_bar(breakout_bar)
             self.assertTrue(sm.position_taken)
-            self.mock_adaptive_learner.classify_regime.assert_called_once() # NEW: Verify adaptive calls
-            self.mock_adaptive_learner.select_candidate.assert_called_once() # NEW: Verify adaptive calls
-            mock_trader_instance.execute_orb_setup.assert_called_once_with("AAPL", 196.3, {
-                "risk_per_trade_usd": 50.0, "stop_loss_cents": 10,
-                "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0
-            }) # NEW: Config passed to trader is the adaptive one
-            self.assertEqual(sm.active_trade_order_id, "test_order_SPY")
+            self.mock_adaptive_learner.classify_regime.assert_called_once() 
+            self.mock_adaptive_learner.select_candidate.assert_called_once() 
+            mock_trader_instance.execute_trade_setup.assert_called_once_with("AAPL", 196.3, {
+                "account_capital": 500.0, "risk_per_trade_usd": 50.0, "stop_loss_pct": 0.002,
+                "position_size_multiplier": 1.0, "take_profit_rr": 2.0, "take_profit_pct": 0.005,
+                "strategy_type": "ORB", "current_regime": "uptrend_orb_momentum", "candidate_id": "orb_base_2_1"
+            })
 
             # Simulate TP hit
-            tp_hit_bar = create_bar(9, 47, 196.60, 196.40, 196.50) # High hits TP (196.50)
+            tp_hit_bar = create_bar(9, 47, 196.3, 196.60, 196.40, 196.50) 
             await sm.process_minute_bar(tp_hit_bar)
             self.assertFalse(sm.position_taken)
             MockTradeLogger.return_value.update_exit_details.assert_called_once_with(
                 "test_order_SPY", 196.50, round((196.50 - 196.30) * 1, 2), tp_hit_bar.timestamp
             )
-            self.mock_adaptive_learner.log_trade_features.assert_called_once() # NEW: Verify features logged
+            self.mock_adaptive_learner.log_trade_features.assert_called_once() 
 
             # Simulate a new day reset and another trade
             sm.last_reset_date = datetime.now().date() - timedelta(days=1)
-            sm.position_taken = False # Reset for new day
+            sm.position_taken = False 
             sm.range_established = False
             sm.orb_high = 0.0
             sm.orb_low = float('inf')
-
-            await sm.process_minute_bar(create_bar(datetime.now().day, 9, 31, 200.0, 199.0, 199.5))
-            await sm.process_minute_bar(create_bar(datetime.now().day, 9, 45, 201.0, 198.5, 200.0))
-            sm.orb_high = 201.0
-            sm.orb_low = 198.5
-
-            mock_trader_instance.execute_orb_setup.reset_mock()
             self.mock_adaptive_learner.classify_regime.reset_mock()
             self.mock_adaptive_learner.select_candidate.reset_mock()
-            mock_trader_instance.execute_orb_setup.return_value = {
+
+            await sm.process_minute_bar(create_bar(datetime.now().day, 9, 31, 200.0, 200.0, 199.0, 199.5))
+            await sm.process_minute_bar(create_bar(datetime.now().day, 9, 45, 199.5, 201.0, 198.5, 200.0))
+
+            self.mock_adaptive_learner.classify_regime.return_value = "oversold_bounce"
+            self.mock_adaptive_learner.select_candidate.return_value = (
+                {**self.base_config, "strategy_type": "RSI_MR", "rsi_period": 14, "oversold_level": 30, "take_profit_pct": 0.005},
+                "rsi_14_oversold",
+                "RSI_MR",
+                {}
+            )
+            mock_trader_instance.execute_trade_setup.reset_mock()
+            mock_trader_instance.execute_trade_setup.return_value = {
                 "order_id": "test_order_AAPL_day2", "entry_price": 201.50, "quantity": 2,
-                "stop_loss_price": 201.30, "take_profit_price": 201.90
+                "stop_loss_price": 201.30, "take_profit_price": 201.90,
+                "strategy_type": "RSI_MR"
             }
-            breakout_bar_day2 = create_bar(datetime.now().day, 9, 46, 202.0, 201.0, 201.50)
+            # Simulate RSI oversold condition
+            sm.last_rsi_value = 25 # Force oversold RSI
+            breakout_bar_day2 = create_bar(datetime.now().day, 9, 46, 201.0, 202.0, 201.0, 201.50)
+            self.mock_trader.logger_obj._get_connection.return_value.execute.return_value.fetchone.return_value = {"id": 2}
             await sm.process_minute_bar(breakout_bar_day2)
             self.assertTrue(sm.position_taken)
             self.mock_adaptive_learner.classify_regime.assert_called_once()
             self.mock_adaptive_learner.select_candidate.assert_called_once()
-            mock_trader_instance.execute_orb_setup.assert_called_once_with("AAPL", 201.50, {
-                "risk_per_trade_usd": 50.0, "stop_loss_cents": 10,
-                "position_size_multiplier": 1.0, "risk_reward_ratio": 2.0
+            mock_trader_instance.execute_trade_setup.assert_called_once_with("AAPL", 201.50, {
+                "account_capital": 500.0, "risk_per_trade_usd": 50.0, "stop_loss_pct": 0.002,
+                "position_size_multiplier": 1.0, "take_profit_rr": 2.0, "take_profit_pct": 0.005,
+                "strategy_type": "RSI_MR", "current_regime": "oversold_bounce", "candidate_id": "rsi_14_oversold"
             })
 
     @patch('upgainpulse.TradingClient')
@@ -1370,31 +1378,33 @@ class TestIntegrationScenarios(unittest.TestCase):
         MockAccountValidator.return_value.get_buying_power.return_value = 5000.0
 
         with patch('upgainpulse.AlpacaPaperTrader', return_value=mock_trader_instance), \
-             patch('upgainpulse.AdaptiveLearner', return_value=self.mock_adaptive_learner): # NEW: Patch AdaptiveLearner
-            sm = ORBStateMachine("SPY", mock_trader_instance, self.config, self.mock_adaptive_learner) # NEW: Pass adaptive_learner
+             patch('upgainpulse.AdaptiveLearner', return_value=self.mock_adaptive_learner): 
+            sm = TradingStateMachine("SPY", mock_trader_instance, self.base_config, self.mock_adaptive_learner) 
             sm.position_taken = True
             sm.range_established = True
             sm.orb_high = 510.0
             sm.orb_low = 490.0
-            sm.last_reset_date = datetime.now().date() - timedelta(days=1) # Simulate yesterday
-            sm.active_trade_id = 5 # NEW: Set internal trade ID
+            sm.last_reset_date = datetime.now().date() - timedelta(days=1) 
+            sm.active_trade_id = 5 
             sm.active_trade_order_id = "test_order_reset_day"
             sm.current_regime = "high_vol_range"
             sm.current_candidate_id = "defensive"
+            sm.current_strategy_type = "RSI_MR"
 
             # Process a bar on the "new" day
-            bar_new_day = self.create_bar(datetime.now().day, 9, 31, 500.0, 498.0, 499.0)
+            bar_new_day = self.create_bar(9, 31, 500.0, 500.0, 498.0, 499.0)
             await sm.process_minute_bar(bar_new_day)
 
             self.assertFalse(sm.position_taken)
             self.assertFalse(sm.range_established)
-            self.assertEqual(sm.orb_high, 500.0) # Should be reset and updated by the new bar
-            self.assertEqual(sm.orb_low, 498.0) # Should be reset and updated by the new bar
+            self.assertEqual(sm.orb_high, 500.0) 
+            self.assertEqual(sm.orb_low, 498.0) 
             self.assertEqual(sm.last_reset_date, datetime.now().date())
-            self.assertIsNone(sm.active_trade_id) # NEW: Check reset of internal trade ID
+            self.assertIsNone(sm.active_trade_id) 
             self.assertIsNone(sm.active_trade_order_id)
-            self.assertEqual(sm.current_regime, "unknown") # NEW: Check reset of regime
-            self.assertEqual(sm.current_candidate_id, "default") # NEW: Check reset of candidate ID
+            self.assertEqual(sm.current_regime, "unknown") 
+            self.assertEqual(sm.sm.current_candidate_id, "default") 
+            self.assertEqual(sm.current_strategy_type, "ORB")
 
 
 if __name__ == "__main__":

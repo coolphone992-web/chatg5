@@ -17,6 +17,8 @@ from alpaca.trading.errors import APIError
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 
+from adaptive_strategy import AdaptiveLearner, CandidateConfig # NEW: Import AdaptiveLearner
+
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
@@ -111,7 +113,7 @@ def calculate_position_size(current_price: float, config: Dict, available_buying
     return max(qty, 0)
 
 # =============================================================================
-# TRADE LOGGING (DATABASE)
+# TRADE LOGGING (DATABASE) - MODIFIED FOR ADAPTIVE LAYER
 # =============================================================================
 class TradeLogger:
     def __init__(self, db_path="upgainpulse_paper.db"):
@@ -131,6 +133,7 @@ class TradeLogger:
         with self.lock:
             conn = self._get_connection()
             cursor = conn.cursor()
+            # MODIFIED: Added regime and candidate_id columns
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,24 +149,28 @@ class TradeLogger:
                     status TEXT DEFAULT "OPEN",
                     order_id TEXT,
                     pnl REAL,
+                    regime TEXT,           -- NEW: Market regime at time of trade
+                    candidate_id TEXT,     -- NEW: ID of the candidate config used
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             conn.commit()
             logger.info("Trade database initialized")
  
-    def log_entry(self, ticker: str, setup_type: str, entry_price: float, qty: int, sl: float, tp: float, order_id: Optional[str] = None) -> None:
+    def log_entry(self, ticker: str, setup_type: str, entry_price: float, qty: int, sl: float, tp: float, 
+                  order_id: Optional[str] = None, regime: Optional[str] = None, candidate_id: Optional[str] = None) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self.lock:
             conn = self._get_connection()
             cursor = conn.cursor()
             try:
+                # MODIFIED: Added regime and candidate_id to insert statement
                 cursor.execute('''
-                    INSERT INTO trades (timestamp_entry, ticker, setup_type, entry_price, quantity, stop_loss, take_profit, status, order_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (timestamp, ticker, setup_type, entry_price, qty, sl, tp, 'OPEN', order_id))
+                    INSERT INTO trades (timestamp_entry, ticker, setup_type, entry_price, quantity, stop_loss, take_profit, status, order_id, regime, candidate_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, ticker, setup_type, entry_price, qty, sl, tp, 'OPEN', order_id, regime, candidate_id))
                 conn.commit()
-                logger.info(f"OPEN | {ticker} ${entry_price:.2f} x{qty} | SL ${sl:.2f} | TP ${tp:.2f} | Order: {order_id}")
+                logger.info(f"OPEN | {ticker} ${entry_price:.2f} x{qty} | SL ${sl:.2f} | TP ${tp:.2f} | Order: {order_id} | Regime: {regime} | Config: {candidate_id}")
             except sqlite3.Error as e:
                 logger.error(f"DB insert error: {e}")
 
@@ -255,7 +262,9 @@ class AlpacaPaperTrader:
             order = self.client.submit_order(order_data)
             self.last_order_time[ticker] = now
             logger.info(f"ORDER {ticker} | {order.id}")
-            self.logger_obj.log_entry(ticker, "ORB_LONG", current_price, qty, sl_price, tp_price, order.id)
+            # MODIFIED: Added regime and candidate_id to log_entry
+            self.logger_obj.log_entry(ticker, "ORB_LONG", current_price, qty, sl_price, tp_price, order.id, 
+                                      regime=config.get("current_regime"), candidate_id=config.get("candidate_id"))
             return {
                 "order_id": order.id,
                 "entry_price": current_price,
@@ -271,23 +280,27 @@ class AlpacaPaperTrader:
             return None
 
 # =============================================================================
-# ORB STATE MACHINE
+# ORB STATE MACHINE - MODIFIED FOR ADAPTIVE LAYER
 # =============================================================================
 class ORBStateMachine:
-    def __init__(self, ticker: str, trader: AlpacaPaperTrader, config: Dict):
+    def __init__(self, ticker: str, trader: AlpacaPaperTrader, config: Dict, adaptive_learner: AdaptiveLearner):
         self.ticker = ticker
         self.trader = trader
         self.config = config
+        self.adaptive_learner = adaptive_learner # NEW: AdaptiveLearner instance
         self.market_open_et = time(9, 30)
         self.range_end_et = time(9, 45)
         self.reset_daily_state()
 
         # Active trade details
+        self.active_trade_id: Optional[int] = None # NEW: Store internal trade ID for feature logging
         self.active_trade_order_id: Optional[str] = None
         self.active_trade_entry_price: float = 0.0
         self.active_trade_sl_price: float = 0.0
         self.active_trade_tp_price: float = 0.0
         self.active_trade_qty: int = 0
+        self.current_regime: str = "unknown" # NEW: Store current regime
+        self.current_candidate_id: str = "default" # NEW: Store current candidate ID
 
     def reset_daily_state(self):
         self.orb_high = 0.0
@@ -295,11 +308,14 @@ class ORBStateMachine:
         self.range_established = False
         self.position_taken = False
         self.last_reset_date = datetime.now().date()
+        self.active_trade_id = None # NEW: Reset internal trade ID
         self.active_trade_order_id = None
         self.active_trade_entry_price = 0.0
         self.active_trade_sl_price = 0.0
         self.active_trade_tp_price = 0.0
         self.active_trade_qty = 0
+        self.current_regime = "unknown"
+        self.current_candidate_id = "default"
 
     def check_daily_reset(self):
         today = datetime.now().date()
@@ -341,23 +357,79 @@ class ORBStateMachine:
                     pnl,
                     bar.timestamp # Use bar timestamp for exit
                 )
+                # NEW: Log trade features after trade closure
+                if self.active_trade_id and self.current_regime and self.current_candidate_id:
+                    # Placeholder for actual feature values - you'll need to calculate these
+                    orb_width_pct = (self.orb_high - self.orb_low) / self.orb_low * 100 if self.orb_low > 0 else 0
+                    gap_pct = 0.0 # Placeholder
+                    rel_volume = 1.0 # Placeholder
+                    atr_pct = 0.0 # Placeholder
+                    market_trend = "unknown" # Placeholder
+
+                    self.adaptive_learner.log_trade_features(
+                        trade_id=self.active_trade_id,
+                        ticker=self.ticker,
+                        regime=self.current_regime,
+                        candidate_id=self.current_candidate_id,
+                        orb_width_pct=orb_width_pct,
+                        gap_pct=gap_pct,
+                        rel_volume=rel_volume,
+                        atr_pct=atr_pct,
+                        market_trend=market_trend,
+                    )
+
                 self.position_taken = False
+                self.active_trade_id = None # NEW: Clear internal trade ID
                 self.active_trade_order_id = None # Clear active trade
                 self.active_trade_entry_price = 0.0
                 self.active_trade_sl_price = 0.0
                 self.active_trade_tp_price = 0.0
                 self.active_trade_qty = 0
+                self.current_regime = "unknown"
+                self.current_candidate_id = "default"
                 return
 
         # If range established and no position taken, check for breakout
         if self.range_established and not self.position_taken:
             if bar.close > self.orb_high:
                 logger.info(f"BREAKOUT {self.ticker} @ ${bar.close:.2f}")
+                
+                # NEW: Classify regime and select adaptive config
+                # Placeholder values for regime classification - replace with real data
+                atr_pct = 0.0 # Calculate actual ATR % from recent bars
+                gap_pct = 0.0 # Calculate actual gap % from previous close
+                market_above_ma = True # Determine if market is above key moving average
+                rel_volume = 1.0 # Calculate actual relative volume
+
+                self.current_regime = self.adaptive_learner.classify_regime(
+                    atr_pct=atr_pct, gap_pct=gap_pct, market_above_ma=market_above_ma, rel_volume=rel_volume
+                )
+                # Create a temporary config dict to pass to select_candidate
+                temp_config_for_adaptive = {
+                    "risk_per_trade_usd": self.config.get("risk_per_trade_usd", 50.0),
+                    "stop_loss_cents": self.config.get("stop_loss_cents", 10),
+                    "position_size_multiplier": self.config.get("position_size_multiplier", 1.0),
+                    "risk_reward_ratio": self.config.get("risk_reward_ratio", 2.0),
+                    "account_capital": self.config.get("account_capital", 0.0)
+                }
+                adaptive_config, candidate_id, stats = self.adaptive_learner.select_candidate(
+                    ticker=self.ticker,
+                    regime=self.current_regime,
+                    default_config=temp_config_for_adaptive
+                )
+                self.current_candidate_id = candidate_id
+                logger.info(f"ADAPTIVE | {self.ticker} | Regime: {self.current_regime} | Config: {self.current_candidate_id} | SL: {adaptive_config.get("stop_loss_cents")}c | RR: {adaptive_config.get("risk_reward_ratio")}:1")
+
                 order_details = await asyncio.to_thread(
-                    self.trader.execute_orb_setup, self.ticker, bar.close, self.config
+                    self.trader.execute_orb_setup, self.ticker, bar.close, adaptive_config # Use adaptive_config
                 )
                 if order_details:
                     self.position_taken = True
+                    # NEW: Fetch the internal trade ID from the logger after entry
+                    # This assumes log_entry returns the ID or you can query it
+                    # For now, we'll use a placeholder or query the last inserted ID
+                    # A more robust solution would be to have log_entry return the ID
+                    self.active_trade_id = self.trader.logger_obj._get_connection().execute("SELECT id FROM trades ORDER BY id DESC LIMIT 1").fetchone()["id"]
                     self.active_trade_order_id = order_details["order_id"]
                     self.active_trade_entry_price = order_details["entry_price"]
                     self.active_trade_sl_price = order_details["stop_loss_price"]
@@ -397,10 +469,10 @@ class RobustWebSocketManager:
             for symbol in symbols:
                 if 'bars' not in self.subscriptions:
                     self.subscriptions['bars'] = []
-                if handler not in self.subscriptions['bars']:
-                    self.subscriptions['bars'].append(handler) # Store handler for re-subscription
-                if symbol not in self.subscriptions['bars']: # This is not quite right, need to store symbol per handler
-                    self.subscriptions['bars'].append(symbol)
+                # Store handler and symbols together for re-subscription
+                # This assumes one handler for all bars, which is true in your main.
+                if (handler, symbol) not in self.subscriptions['bars']:
+                    self.subscriptions['bars'].append((handler, symbol))
         else:
             logger.error("Stream not connected. Cannot subscribe.")
 
@@ -412,15 +484,11 @@ class RobustWebSocketManager:
                     # Re-apply all previous subscriptions after reconnect
                     for sub_type, items in self.subscriptions.items():
                         if sub_type == 'bars':
-                            # Assuming items are (handler, symbol) pairs or similar
-                            # This part needs refinement based on how you store subscriptions
-                            # For now, a simple re-subscribe for all symbols with the same handler
-                            # This assumes one handler for all bars, which is true in your main.
-                            if items: # items here would be a list of symbols
-                                handler = items[0] # Assuming the first item is the handler
-                                symbols_to_resubscribe = items[1:] # The rest are symbols
-                                self.stream.subscribe_bars(handler, *symbols_to_resubscribe)
-                                logger.info(f"Re-subscribed to bars for {symbols_to_resubscribe}")
+                            if items:
+                                # Re-subscribe each (handler, symbol) pair
+                                for handler, symbol in items:
+                                    self.stream.subscribe_bars(handler, symbol)
+                                    logger.info(f"Re-subscribed to bars for {symbol} with handler {handler.__name__}")
 
                 await self.stream._run_forever()
             except Exception as e:
@@ -435,7 +503,7 @@ class RobustWebSocketManager:
                 self.stream = None # Force re-connection
 
 # =============================================================================
-# MAIN ENGINE
+# MAIN ENGINE - MODIFIED FOR ADAPTIVE LAYER
 # =============================================================================
 class UpGainPulseEngine:
     def __init__(self, tickers: List[str], config: Dict):
@@ -446,7 +514,8 @@ class UpGainPulseEngine:
         alpaca_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
         validator = AccountValidator(alpaca_client)
         self.trader = AlpacaPaperTrader(API_KEY, SECRET_KEY, self.logger_obj, validator)
-        self.state_machines = {ticker: ORBStateMachine(ticker, self.trader, config) for ticker in tickers}
+        self.adaptive_learner = AdaptiveLearner() # NEW: Initialize AdaptiveLearner
+        self.state_machines = {ticker: ORBStateMachine(ticker, self.trader, config, self.adaptive_learner) for ticker in tickers} # NEW: Pass adaptive_learner
         self.ws_manager = RobustWebSocketManager(API_KEY, SECRET_KEY)
 
     async def run(self):
@@ -460,9 +529,10 @@ class UpGainPulseEngine:
                     await self.state_machines[ticker].process_minute_bar(bar)
 
             # Correctly subscribe to bars for all tickers
-            stream.subscribe_bars(handle_bar, *self.tickers)
-            self.ws_manager.subscriptions['bars'] = [handle_bar] + list(self.tickers) # Store handler and symbols
-
+            # MODIFIED: Store handler and symbols as tuples for re-subscription
+            for ticker_sym in self.tickers:
+                self.ws_manager.subscribe_bars(handle_bar, ticker_sym)
+            
             logger.info(f"Subscribed to {len(self.tickers)} tickers")
             await self.ws_manager.run_with_reconnect()
         except Exception as e:

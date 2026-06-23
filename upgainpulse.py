@@ -317,11 +317,11 @@ class TradingStateMachine:
         self.adaptive_learner = adaptive_learner
         self.market_open_et = time(9, 30)
         self.range_end_et = time(9, 45)
-        self.reset_daily_state()
-
-        # Historical data for indicator calculation
+        # Historical data for indicator calculation (MUST be before reset_daily_state)
         self.bars: Deque[Bar] = deque(maxlen=50) # Store last 50 bars for SMA/RSI
         self.closes: Deque[float] = deque(maxlen=50) # Store last 50 closes for SMA/RSI
+
+        self.reset_daily_state()
 
         # Active trade details
         self.active_trade_id: Optional[int] = None 

@@ -36,10 +36,16 @@ sys.modules['alpaca.data.live'] = MagicMock()
 sys.modules['alpaca.data.models'] = MagicMock()
 sys.modules['dotenv'] = MagicMock()
 
+# Set env vars FIRST (before any import of upgainpulse)
+os.environ['ALPACA_PAPER_API_KEY'] = 'test_key'
+os.environ['ALPACA_PAPER_SECRET_KEY'] = 'test_secret'
+
 # Set alpaca.trading.errors.APIError to be a real Exception subclass
+sys.modules['alpaca.common'] = MagicMock()
 sys.modules['alpaca.trading.errors'].APIError = MockAPIError
 
 # Import upgainpulse (will use env vars and mocked modules)
+import upgainpulse
 from upgainpulse import *
 from adaptive_strategy import AdaptiveLearner, CandidateConfig, DEFAULT_CANDIDATES # NEW: Import AdaptiveLearner and CandidateConfig
 

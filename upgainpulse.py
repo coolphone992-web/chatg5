@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.trading import TakeProfitRequest, StopLossRequest
-from alpaca.common import APIError
+from alpaca.trading.models import TakeProfitRequest, StopLossRequest
+from alpaca.trading.errors import APIError
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 
@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 API_KEY = os.getenv("ALPACA_PAPER_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_PAPER_SECRET_KEY")
-PAPER_API_ENDPOINT = os.getenv("ALPACA_PAPER_API_ENDPOINT", "https://paper-api.alpaca.markets")
 
 if not API_KEY or not SECRET_KEY:
     logger.error("CRITICAL: Alpaca API keys not found in .env file.")

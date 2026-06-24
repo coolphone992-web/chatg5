@@ -159,6 +159,12 @@ class AdaptiveLearner:
         """
         regime = "unknown"
 
+        # Default None values to 0.0 to avoid comparison errors
+        atr_pct = atr_pct or 0.0
+        gap_pct = gap_pct or 0.0
+        rel_volume = rel_volume or 1.0
+        orb_width_pct = orb_width_pct or 0.0
+
         # High Volatility / Gap Play
         if atr_pct >= 2.0 or abs(gap_pct) >= 1.5: # ATR 2% or gap 1.5%
             return "high_vol_gap" if market_trend == "up" else "high_vol_gap_down"

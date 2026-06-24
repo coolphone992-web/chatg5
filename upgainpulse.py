@@ -242,7 +242,7 @@ class AlpacaPaperTrader:
             stop_loss_pct = float(config.get("stop_loss_pct", 0.002)) # Expect percentage stop loss
             multiplier = float(config.get("position_size_multiplier", 1.0))
             rr_ratio = float(config.get("take_profit_rr", 2.0)) # Use RR for ORB/SMA
-            take_profit_pct = float(config.get("take_profit_pct", 0.0)) # Use absolute % for RSI
+            take_profit_pct = float(config.get("take_profit_pct") or 0.0) # Use absolute % for RSI, default 0 if None
             strategy_type = config.get("strategy_type", "UNKNOWN")
 
             available_bp = self.validator.get_buying_power()
